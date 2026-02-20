@@ -1,2211 +1,1674 @@
-# =========================================== BOT CODE STARTS HERE ===========================================
 import discord
 from discord.ext import commands, tasks
-from discord import ui, app_commands
-import os
-import random
-import string
-import json
-import subprocess
-from dotenv import load_dotenv
+from discord import app_commands
 import asyncio
-import datetime
-import docker
+import subprocess
+import json
+import os
 import time
-import logging
-import traceback
-import aiohttp
-import socket
+import random
 import re
 import psutil
-import platform
-import shutil
-from typing import Optional, Literal
-import sqlite3
-import pickle
-import base64
-import threading
-import textwrap
-import math
-from dataclasses import dataclass
-from collections import defaultdict
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('VantaNode_bot.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger('[VantaNode]')
-
-# Load environment variables
-load_dotenv()
-
-# Bot configuration
-TOKEN = os.getenv('DISCORD_TOKEN')
-ADMIN_IDS = {int(id_) for id_ in os.getenv('ADMIN_IDS', '1210291131301101618').split(',') if id_.strip()}
-ADMIN_ROLE_ID = int(os.getenv('ADMIN_ROLE_ID', '1376177459870961694'))
-WATERMARK = "VantaNode VPS Service"
-WELCOME_MESSAGE = "Welcome To VantaNode! Get Started With Us!"
-MAX_VPS_PER_USER = int(os.getenv('MAX_VPS_PER_USER', '3'))
-DEFAULT_OS_IMAGE = os.getenv('DEFAULT_OS_IMAGE', 'ubuntu:22.04')
-DOCKER_NETWORK = os.getenv('DOCKER_NETWORK', 'bridge')
-MAX_CONTAINERS = int(os.getenv('MAX_CONTAINERS', '100'))
-DB_FILE = 'VantaNode.db'
-BACKUP_FILE = 'VantaNode_backup.pkl'
-
-# Resource tracking
-CPU_CORES_AVAILABLE = psutil.cpu_count(logical=False)
-ALLOCATED_CPU_CORES = set()
-VPS_UPTIME_TRACKER = {}
-
-# Dockerfile template for custom images - OPTIMIZED FOR SPEED
-DOCKERFILE_TEMPLATE = """FROM {base_image}
-
-# Prevent prompts and use faster mirrors
-ENV DEBIAN_FONTEND=noninteractive
-
-# Use faster APT sources and install minimal packages
-RUN sed -i 's/archive.ubuntu.com/mirror.rackspace.com/g' /etc/apt/sources.list && \\
-    apt-get update && \\
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
-        sudo openssh-server tmate neofetch htop nano wget curl git tmux && \\
-    apt-get clean && \\
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-# Setup user
-RUN useradd -m -s /bin/bash {username} && \\
-    echo "{username}:{user_password}" | chpasswd && \\
-    echo "root:{root_password}" | chpasswd && \\
-    usermod -aG sudo {username}
-
-# SSH configuration
-RUN mkdir -p /var/run/sshd && \\
-    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \\
-    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-
-# Customization
-RUN echo '{welcome_message}' > /etc/motd && \\
-    echo 'echo "{welcome_message}"' >> /home/{username}/.bashrc && \\
-    echo '{watermark}' > /etc/machine-info && \\
-    echo 'vantanode-{vps_id}' > /etc/hostname
-
-CMD ["/usr/sbin/sshd", "-D"]
-"""
-
-class Database:
-    """Handles all data persistence using SQLite3"""
-    def __init__(self, db_file):
-        self.conn = sqlite3.connect(db_file, check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self._create_tables()
-        self._initialize_settings()
-
-    def _create_tables(self):
-        """Create necessary tables"""
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS vps_instances (
-                token TEXT PRIMARY KEY,
-                vps_id TEXT UNIQUE,
-                container_id TEXT,
-                memory INTEGER,
-                cpu INTEGER,
-                disk INTEGER,
-                username TEXT,
-                password TEXT,
-                root_password TEXT,
-                created_by TEXT,
-                created_at TEXT,
-                tmate_session TEXT,
-                watermark TEXT,
-                os_image TEXT,
-                restart_count INTEGER DEFAULT 0,
-                last_restart TEXT,
-                status TEXT DEFAULT 'running',
-                use_custom_image BOOLEAN DEFAULT 1,
-                allocated_cpus TEXT,
-                uptime_start TEXT,
-                total_uptime INTEGER DEFAULT 0
-            )
-        ''')
-        
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS usage_stats (
-                key TEXT PRIMARY KEY,
-                value INTEGER DEFAULT 0
-            )
-        ''')
-        
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS system_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        ''')
-        
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS banned_users (
-                user_id TEXT PRIMARY KEY
-            )
-        ''')
-        
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS admin_users (
-                user_id TEXT PRIMARY KEY
-            )
-        ''')
-        
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS resource_usage (
-                vps_id TEXT PRIMARY KEY,
-                cpu_usage REAL DEFAULT 0,
-                memory_usage REAL DEFAULT 0,
-                disk_usage REAL DEFAULT 0,
-                network_tx REAL DEFAULT 0,
-                network_rx REAL DEFAULT 0,
-                last_updated TEXT
-            )
-        ''')
-        
-        self.conn.commit()
-
-    def _initialize_settings(self):
-        """Initialize default settings"""
-        defaults = {
-            'max_containers': str(MAX_CONTAINERS),
-            'max_vps_per_user': str(MAX_VPS_PER_USER),
-            'total_allocated_memory': '0',
-            'total_allocated_cpu': '0',
-            'total_allocated_disk': '0'
-        }
-        for key, value in defaults.items():
-            self.cursor.execute('INSERT OR IGNORE INTO system_settings (key, value) VALUES (?, ?)', (key, value))
-        
-        # Load admin users from database
-        self.cursor.execute('SELECT user_id FROM admin_users')
-        for row in self.cursor.fetchall():
-            ADMIN_IDS.add(int(row[0]))
-        
-        # Initialize uptime for running VPS
-        self.cursor.execute("SELECT vps_id, container_id FROM vps_instances WHERE status = 'running'")
-        for vps_id, container_id in self.cursor.fetchall():
-            VPS_UPTIME_TRACKER[vps_id] = {
-                'start_time': datetime.datetime.now(),
-                'container_id': container_id
-            }
-            
-        self.conn.commit()
-
-    def get_setting(self, key, default=None):
-        self.cursor.execute('SELECT value FROM system_settings WHERE key = ?', (key,))
-        result = self.cursor.fetchone()
-        return int(result[0]) if result else default
-
-    def set_setting(self, key, value):
-        self.cursor.execute('INSERT OR REPLACE INTO system_settings (key, value) VALUES (?, ?)', (key, str(value)))
-        self.conn.commit()
-
-    def update_resource_usage(self, vps_id, cpu, memory, disk, net_tx, net_rx):
-        """Update resource usage statistics"""
-        self.cursor.execute('''
-            INSERT OR REPLACE INTO resource_usage 
-            (vps_id, cpu_usage, memory_usage, disk_usage, network_tx, network_rx, last_updated)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (vps_id, cpu, memory, disk, net_tx, net_rx, datetime.datetime.now().isoformat()))
-        self.conn.commit()
-
-    def get_resource_usage(self, vps_id):
-        """Get resource usage for a VPS"""
-        self.cursor.execute('SELECT * FROM resource_usage WHERE vps_id = ?', (vps_id,))
-        row = self.cursor.fetchone()
-        if not row:
-            return None
-        columns = [desc[0] for desc in self.cursor.description]
-        return dict(zip(columns, row))
-
-    def update_uptime(self, vps_id, uptime_seconds):
-        """Update total uptime for VPS"""
-        self.cursor.execute('''
-            UPDATE vps_instances 
-            SET total_uptime = total_uptime + ?
-            WHERE vps_id = ?
-        ''', (uptime_seconds, vps_id))
-        self.conn.commit()
-
-    def get_stat(self, key, default=0):
-        self.cursor.execute('SELECT value FROM usage_stats WHERE key = ?', (key,))
-        result = self.cursor.fetchone()
-        return result[0] if result else default
-
-    def increment_stat(self, key, amount=1):
-        current = self.get_stat(key)
-        self.cursor.execute('INSERT OR REPLACE INTO usage_stats (key, value) VALUES (?, ?)', (key, current + amount))
-        self.conn.commit()
-
-    def get_vps_by_id(self, vps_id):
-        self.cursor.execute('SELECT * FROM vps_instances WHERE vps_id = ?', (vps_id,))
-        row = self.cursor.fetchone()
-        if not row:
-            return None, None
-        columns = [desc[0] for desc in self.cursor.description]
-        vps = dict(zip(columns, row))
-        return vps['token'], vps
-
-    def get_vps_by_token(self, token):
-        self.cursor.execute('SELECT * FROM vps_instances WHERE token = ?', (token,))
-        row = self.cursor.fetchone()
-        if not row:
-            return None
-        columns = [desc[0] for desc in self.cursor.description]
-        return dict(zip(columns, row))
-
-    def get_user_vps_count(self, user_id):
-        self.cursor.execute('SELECT COUNT(*) FROM vps_instances WHERE created_by = ?', (str(user_id),))
-        return self.cursor.fetchone()[0]
-
-    def get_user_vps(self, user_id):
-        self.cursor.execute('SELECT * FROM vps_instances WHERE created_by = ?', (str(user_id),))
-        columns = [desc[0] for desc in self.cursor.description]
-        return [dict(zip(columns, row)) for row in self.cursor.fetchall()]
-
-    def get_all_vps(self):
-        self.cursor.execute('SELECT * FROM vps_instances')
-        columns = [desc[0] for desc in self.cursor.description]
-        return {row[0]: dict(zip(columns, row)) for row in self.cursor.fetchall()}
-
-    def add_vps(self, vps_data):
-        columns = ', '.join(vps_data.keys())
-        placeholders = ', '.join('?' for _ in vps_data)
-        self.cursor.execute(f'INSERT INTO vps_instances ({columns}) VALUES ({placeholders})', tuple(vps_data.values()))
-        
-        # Update total allocated resources
-        memory = vps_data.get('memory', 0)
-        cpu = vps_data.get('cpu', 0)
-        disk = vps_data.get('disk', 0)
-        
-        total_mem = self.get_setting('total_allocated_memory', 0) + memory
-        total_cpu = self.get_setting('total_allocated_cpu', 0) + cpu
-        total_disk = self.get_setting('total_allocated_disk', 0) + disk
-        
-        self.set_setting('total_allocated_memory', total_mem)
-        self.set_setting('total_allocated_cpu', total_cpu)
-        self.set_setting('total_allocated_disk', total_disk)
-        
-        self.conn.commit()
-        self.increment_stat('total_vps_created')
-
-    def remove_vps(self, token):
-        self.cursor.execute('SELECT memory, cpu, disk FROM vps_instances WHERE token = ?', (token,))
-        row = self.cursor.fetchone()
-        if row:
-            memory, cpu, disk = row
-            
-            # Update total allocated resources
-            total_mem = self.get_setting('total_allocated_memory', 0) - memory
-            total_cpu = self.get_setting('total_allocated_cpu', 0) - cpu
-            total_disk = self.get_setting('total_allocated_disk', 0) - disk
-            
-            self.set_setting('total_allocated_memory', max(0, total_mem))
-            self.set_setting('total_allocated_cpu', max(0, total_cpu))
-            self.set_setting('total_allocated_disk', max(0, total_disk))
-        
-        self.cursor.execute('DELETE FROM vps_instances WHERE token = ?', (token,))
-        self.conn.commit()
-        return self.cursor.rowcount > 0
-
-    def update_vps(self, token, updates):
-        set_clause = ', '.join(f'{k} = ?' for k in updates)
-        values = list(updates.values()) + [token]
-        self.cursor.execute(f'UPDATE vps_instances SET {set_clause} WHERE token = ?', values)
-        self.conn.commit()
-        return self.cursor.rowcount > 0
-
-    def is_user_banned(self, user_id):
-        self.cursor.execute('SELECT 1 FROM banned_users WHERE user_id = ?', (str(user_id),))
-        return self.cursor.fetchone() is not None
-
-    def ban_user(self, user_id):
-        self.cursor.execute('INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)', (str(user_id),))
-        self.conn.commit()
-
-    def unban_user(self, user_id):
-        self.cursor.execute('DELETE FROM banned_users WHERE user_id = ?', (str(user_id),))
-        self.conn.commit()
-
-    def get_banned_users(self):
-        self.cursor.execute('SELECT user_id FROM banned_users')
-        return [row[0] for row in self.cursor.fetchall()]
-
-    def add_admin(self, user_id):
-        self.cursor.execute('INSERT OR IGNORE INTO admin_users (user_id) VALUES (?)', (str(user_id),))
-        self.conn.commit()
-        ADMIN_IDS.add(int(user_id))
-
-    def remove_admin(self, user_id):
-        self.cursor.execute('DELETE FROM admin_users WHERE user_id = ?', (str(user_id),))
-        self.conn.commit()
-        if int(user_id) in ADMIN_IDS:
-            ADMIN_IDS.remove(int(user_id))
-
-    def get_admins(self):
-        self.cursor.execute('SELECT user_id FROM admin_users')
-        return [row[0] for row in self.cursor.fetchall()]
-
-    def backup_data(self):
-        """Backup all data to a file"""
-        data = {
-            'vps_instances': self.get_all_vps(),
-            'usage_stats': {},
-            'system_settings': {},
-            'banned_users': self.get_banned_users(),
-            'admin_users': self.get_admins()
-        }
-        
-        # Get usage stats
-        self.cursor.execute('SELECT * FROM usage_stats')
-        for row in self.cursor.fetchall():
-            data['usage_stats'][row[0]] = row[1]
-            
-        # Get system settings
-        self.cursor.execute('SELECT * FROM system_settings')
-        for row in self.cursor.fetchall():
-            data['system_settings'][row[0]] = row[1]
-            
-        with open(BACKUP_FILE, 'wb') as f:
-            pickle.dump(data, f)
-            
-        return True
-
-    def restore_data(self):
-        """Restore data from backup file"""
-        if not os.path.exists(BACKUP_FILE):
-            return False
-            
-        try:
-            with open(BACKUP_FILE, 'rb') as f:
-                data = pickle.load(f)
-                
-            # Clear all tables
-            self.cursor.execute('DELETE FROM vps_instances')
-            self.cursor.execute('DELETE FROM usage_stats')
-            self.cursor.execute('DELETE FROM system_settings')
-            self.cursor.execute('DELETE FROM banned_users')
-            self.cursor.execute('DELETE FROM admin_users')
-            
-            # Restore VPS instances
-            for token, vps in data['vps_instances'].items():
-                columns = ', '.join(vps.keys())
-                placeholders = ', '.join('?' for _ in vps)
-                self.cursor.execute(f'INSERT INTO vps_instances ({columns}) VALUES ({placeholders})', tuple(vps.values()))
-            
-            # Restore usage stats
-            for key, value in data['usage_stats'].items():
-                self.cursor.execute('INSERT INTO usage_stats (key, value) VALUES (?, ?)', (key, value))
-                
-            # Restore system settings
-            for key, value in data['system_settings'].items():
-                self.cursor.execute('INSERT INTO system_settings (key, value) VALUES (?, ?)', (key, value))
-                
-            # Restore banned users
-            for user_id in data['banned_users']:
-                self.cursor.execute('INSERT INTO banned_users (user_id) VALUES (?)', (user_id,))
-                
-            # Restore admin users
-            for user_id in data['admin_users']:
-                self.cursor.execute('INSERT INTO admin_users (user_id) VALUES (?)', (user_id,))
-                ADMIN_IDS.add(int(user_id))
-                
-            self.conn.commit()
-            return True
-        except Exception as e:
-            logger.error(f"Error restoring data: {e}")
-            return False
-
-    def close(self):
-        self.conn.close()
-
-# Initialize bot with command prefix '/'
-class VantaNodeBot(commands.Bot):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.db = Database(DB_FILE)
-        self.session = None
-        self.docker_client = None
-        self.system_stats = {
-            'cpu_usage': 0,
-            'memory_usage': 0,
-            'disk_usage': 0,
-            'network_io': (0, 0),
-            'last_updated': 0
-        }
-        self.my_persistent_views = {}
-
-    async def setup_hook(self):
-        self.session = aiohttp.ClientSession()
-        try:
-            self.docker_client = docker.from_env()
-            logger.info("Docker client initialized successfully")
-            self.loop.create_task(self.update_system_stats())
-            self.loop.create_task(self.update_resource_usage())
-            await self.reconnect_containers()
-            await self.restore_persistent_views()
-            
-            # Start uptime monitor after bot is ready
-            self.uptime_monitor.start()
-        except Exception as e:
-            logger.error(f"Failed to initialize Docker client: {e}")
-            self.docker_client = None
-
-    async def reconnect_containers(self):
-        """Reconnect to existing containers on startup"""
-        if not self.docker_client:
-            return
-            
-        for token, vps in list(self.db.get_all_vps().items()):
-            if vps['status'] == 'running':
-                try:
-                    container = self.docker_client.containers.get(vps['container_id'])
-                    if container.status != 'running':
-                        container.start()
-                    # Update uptime tracker
-                    VPS_UPTIME_TRACKER[vps['vps_id']] = {
-                        'start_time': datetime.datetime.now(),
-                        'container_id': vps['container_id']
-                    }
-                    logger.info(f"Reconnected and started container for VPS {vps['vps_id']}")
-                except docker.errors.NotFound:
-                    logger.warning(f"Container {vps['container_id']} not found, removing from data")
-                    self.db.remove_vps(token)
-                except Exception as e:
-                    logger.error(f"Error reconnecting container {vps['vps_id']}: {e}")
-
-    async def restore_persistent_views(self):
-        """Restore persistent views after restart"""
-        pass
-
-    async def update_system_stats(self):
-        """Update system statistics periodically"""
-        await self.wait_until_ready()
-        while not self.is_closed():
-            try:
-                # CPU usage
-                cpu_percent = psutil.cpu_percent(interval=1)
-                
-                # Memory usage
-                mem = psutil.virtual_memory()
-                
-                # Disk usage
-                disk = psutil.disk_usage('/')
-                
-                # Network IO
-                net_io = psutil.net_io_counters()
-                
-                self.system_stats = {
-                    'cpu_usage': cpu_percent,
-                    'memory_usage': mem.percent,
-                    'memory_used': mem.used / (1024 ** 3),  # GB
-                    'memory_total': mem.total / (1024 ** 3),  # GB
-                    'disk_usage': disk.percent,
-                    'disk_used': disk.used / (1024 ** 3),  # GB
-                    'disk_total': disk.total / (1024 ** 3),  # GB
-                    'network_sent': net_io.bytes_sent / (1024 ** 2),  # MB
-                    'network_recv': net_io.bytes_recv / (1024 ** 2),  # MB
-                    'last_updated': time.time()
-                }
-            except Exception as e:
-                logger.error(f"Error updating system stats: {e}")
-            await asyncio.sleep(30)
-
-    async def update_resource_usage(self):
-        """Update resource usage for all running VPS"""
-        await self.wait_until_ready()
-        while not self.is_closed():
-            try:
-                if not self.docker_client:
-                    await asyncio.sleep(60)
-                    continue
-                    
-                for token, vps in list(self.db.get_all_vps().items()):
-                    if vps['status'] != 'running':
-                        continue
-                        
-                    try:
-                        container = self.docker_client.containers.get(vps['container_id'])
-                        stats = container.stats(stream=False)
-                        
-                        # Calculate CPU usage
-                        cpu_delta = stats['cpu_stats']['cpu_usage']['total_usage'] - stats['precpu_stats']['cpu_usage']['total_usage']
-                        system_delta = stats['cpu_stats']['system_cpu_usage'] - stats['precpu_stats']['system_cpu_usage']
-                        cpu_percent = 0.0
-                        if system_delta > 0:
-                            cpu_percent = (cpu_delta / system_delta) * 100.0 * CPU_CORES_AVAILABLE
-                        
-                        # Memory usage
-                        memory_usage = stats['memory_stats']['usage'] / (1024 ** 3)  # GB
-                        memory_limit = vps['memory']
-                        memory_percent = (memory_usage / memory_limit) * 100 if memory_limit > 0 else 0
-                        
-                        # Network usage
-                        networks = stats.get('networks', {})
-                        rx_bytes = sum(net['rx_bytes'] for net in networks.values()) / (1024 ** 2)  # MB
-                        tx_bytes = sum(net['tx_bytes'] for net in networks.values()) / (1024 ** 2)  # MB
-                        
-                        # Update database
-                        self.db.update_resource_usage(
-                            vps['vps_id'],
-                            cpu_percent,
-                            memory_percent,
-                            0,  # Disk usage placeholder
-                            tx_bytes,
-                            rx_bytes
-                        )
-                        
-                    except Exception as e:
-                        logger.error(f"Error updating resource usage for {vps['vps_id']}: {e}")
-                        
-            except Exception as e:
-                logger.error(f"Error in resource usage update loop: {e}")
-                
-            await asyncio.sleep(60)  # Update every minute
-
-    @tasks.loop(minutes=5)
-    async def uptime_monitor(self):
-        """Monitor and update uptime for all running VPS"""
-        try:
-            current_time = datetime.datetime.now()
-            for vps_id, tracker in list(VPS_UPTIME_TRACKER.items()):
-                try:
-                    # Calculate uptime since last check
-                    uptime_seconds = (current_time - tracker['start_time']).total_seconds()
-                    
-                    # Update database
-                    self.db.update_uptime(vps_id, int(uptime_seconds))
-                    
-                    # Reset start time
-                    tracker['start_time'] = current_time
-                    
-                except Exception as e:
-                    logger.error(f"Error updating uptime for {vps_id}: {e}")
-                    
-        except Exception as e:
-            logger.error(f"Error in uptime monitor: {e}")
-
-    @uptime_monitor.before_loop
-    async def before_uptime_monitor(self):
-        await self.wait_until_ready()
-
-    async def close(self):
-        # Update uptime before closing
-        current_time = datetime.datetime.now()
-        for vps_id, tracker in list(VPS_UPTIME_TRACKER.items()):
-            try:
-                uptime_seconds = (current_time - tracker['start_time']).total_seconds()
-                self.db.update_uptime(vps_id, int(uptime_seconds))
-            except Exception as e:
-                logger.error(f"Error updating uptime on close for {vps_id}: {e}")
-        
-        await super().close()
-        if self.session:
-            await self.session.close()
-        if self.docker_client:
-            self.docker_client.close()
-        self.db.close()
-
-def generate_token():
-    """Generate a random token for VPS access"""
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=24))
-
-def generate_vps_id():
-    """Generate a unique VPS ID"""
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
-
-def generate_ssh_password():
-    """Generate a random SSH password"""
-    chars = string.ascii_letters + string.digits + "!@#$%^&*"
-    return ''.join(random.choices(chars, k=16))
-
-def allocate_cpu_cores(cpu_cores):
-    """Allocate specific CPU cores for isolation"""
-    global ALLOCATED_CPU_CORES
-    
-    available_cores = [c for c in range(CPU_CORES_AVAILABLE) if c not in ALLOCATED_CPU_CORES]
-    
-    if len(available_cores) < cpu_cores:
-        raise Exception(f"Not enough CPU cores available. Requested: {cpu_cores}, Available: {len(available_cores)}")
-    
-    allocated = available_cores[:cpu_cores]
-    ALLOCATED_CPU_CORES.update(allocated)
-    
-    # Convert to cpuset format (0,1,2,3)
-    return ','.join(str(core) for core in allocated)
-
-def free_cpu_cores(cpu_set):
-    """Free allocated CPU cores"""
-    global ALLOCATED_CPU_CORES
-    if cpu_set:
-        cores = [int(c) for c in cpu_set.split(',')]
-        ALLOCATED_CPU_CORES.difference_update(cores)
-
-def has_admin_role(ctx):
-    """Check if user has admin role or is in ADMIN_IDS"""
-    if isinstance(ctx, discord.Interaction):
-        user_id = ctx.user.id
-        roles = ctx.user.roles
-    else:
-        user_id = ctx.author.id
-        roles = ctx.author.roles
-    
-    if user_id in ADMIN_IDS:
-        return True
-    
-    return any(role.id == ADMIN_ROLE_ID for role in roles)
-
-async def capture_ssh_session_line(process):
-    """Capture the SSH session line from tmate output"""
-    try:
-        while True:
-            output = await process.stdout.readline()
-            if not output:
-                break
-            output = output.decode('utf-8').strip()
-            if "ssh session:" in output:
-                return output.split("ssh session:")[1].strip()
-        return None
-    except Exception as e:
-        logger.error(f"Error capturing SSH session: {e}")
-        return None
-
-async def run_docker_command(container_id, command, timeout=30):
-    """Run a Docker command asynchronously with timeout"""
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "docker", "exec", container_id, *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-            if process.returncode != 0:
-                raise Exception(f"Command failed: {stderr.decode()}")
-            return True, stdout.decode()
-        except asyncio.TimeoutError:
-            process.kill()
-            raise Exception(f"Command timed out after {timeout} seconds")
-    except Exception as e:
-        logger.error(f"Error running Docker command: {e}")
-        return False, str(e)
-
-async def build_custom_image(vps_id, username, root_password, user_password, base_image=DEFAULT_OS_IMAGE):
-    """Build a custom Docker image using our OPTIMIZED template"""
-    try:
-        # Create a temporary directory for the Dockerfile
-        temp_dir = f"temp_dockerfiles/{vps_id}"
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        # Generate Dockerfile content with optimized settings
-        dockerfile_content = DOCKERFILE_TEMPLATE.format(
-            base_image=base_image,
-            root_password=root_password,
-            username=username,
-            user_password=user_password,
-            welcome_message=WELCOME_MESSAGE,
-            watermark=WATERMARK,
-            vps_id=vps_id
-        )
-        
-        # Write Dockerfile
-        dockerfile_path = os.path.join(temp_dir, "Dockerfile")
-        with open(dockerfile_path, 'w') as f:
-            f.write(dockerfile_content)
-        
-        # Build the image with cache and parallel builds
-        image_tag = f"vantanode/{vps_id.lower()}:latest"
-        build_process = await asyncio.create_subprocess_exec(
-            "docker", "build", "--pull", "--rm", "-t", image_tag, temp_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        stdout, stderr = await build_process.communicate()
-        
-        if build_process.returncode != 0:
-            raise Exception(f"Failed to build image: {stderr.decode()}")
-        
-        return image_tag
-    except Exception as e:
-        logger.error(f"Error building custom image: {e}")
-        raise
-    finally:
-        # Clean up temporary directory
-        try:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-        except Exception as e:
-            logger.error(f"Error cleaning up temp directory: {e}")
-
-async def setup_container(container_id, status_msg, memory, username, vps_id=None, use_custom_image=False):
-    """FAST container setup with VantaNode customization"""
-    try:
-        # Ensure container is running
-        if isinstance(status_msg, discord.Interaction):
-            await status_msg.followup.send("🔍 Checking container...", ephemeral=True)
-        else:
-            await status_msg.edit(content="🔍 Checking container...")
-            
-        container = bot.docker_client.containers.get(container_id)
-        if container.status != "running":
-            if isinstance(status_msg, discord.Interaction):
-                await status_msg.followup.send("🚀 Starting container...", ephemeral=True)
-            else:
-                await status_msg.edit(content="🚀 Starting container...")
-            container.start()
-            await asyncio.sleep(2)
-
-        # Generate SSH password
-        ssh_password = generate_ssh_password()
-        
-        # Only install packages if not using custom image
-        if not use_custom_image:
-            if isinstance(status_msg, discord.Interaction):
-                await status_msg.followup.send("📦 Installing packages...", ephemeral=True)
-            else:
-                await status_msg.edit(content="📦 Installing packages...")
-                
-            # Update package list with fast mirror
-            success, output = await run_docker_command(container_id, [
-                "bash", "-c", 
-                "sed -i 's/archive.ubuntu.com/mirror.rackspace.com/g' /etc/apt/sources.list && apt-get update"
-            ])
-            if not success:
-                logger.warning(f"Failed to update package list: {output}")
-
-            # Install minimal required packages
-            packages = ["tmate", "openssh-server", "sudo", "neofetch"]
-            success, output = await run_docker_command(container_id, [
-                "apt-get", "install", "-y", "--no-install-recommends"
-            ] + packages)
-            if not success:
-                logger.warning(f"Failed to install packages: {output}")
-
-        # Setup SSH
-        if isinstance(status_msg, discord.Interaction):
-            await status_msg.followup.send("🔐 Configuring SSH...", ephemeral=True)
-        else:
-            await status_msg.edit(content="🔐 Configuring SSH...")
-            
-        # Create user and set password (if not using custom image)
-        if not use_custom_image:
-            user_setup_commands = [
-                f"useradd -m -s /bin/bash {username}",
-                f"echo '{username}:{ssh_password}' | chpasswd",
-                f"usermod -aG sudo {username}",
-                "mkdir -p /var/run/sshd",
-                "sed -i 's/#PermitRootLogin prohibit-root/PermitRootLogin yes/' /etc/ssh/sshd_config",
-                "sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config",
-                "/usr/sbin/sshd"
-            ]
-            
-            for cmd in user_setup_commands:
-                success, output = await run_docker_command(container_id, ["bash", "-c", cmd])
-                if not success:
-                    logger.warning(f"Failed to setup user: {output}")
-
-        # Set VantaNode customization
-        if isinstance(status_msg, discord.Interaction):
-            await status_msg.followup.send("🎨 Setting up VantaNode...", ephemeral=True)
-        else:
-            await status_msg.edit(content="🎨 Setting up VantaNode...")
-            
-        # Create welcome message
-        welcome_cmd = f"echo '{WELCOME_MESSAGE}' > /etc/motd"
-        success, output = await run_docker_command(container_id, ["bash", "-c", welcome_cmd])
-        if not success:
-            logger.warning(f"Could not set welcome message: {output}")
-
-        # Set hostname
-        if not vps_id:
-            vps_id = generate_vps_id()
-        hostname_cmd = f"echo 'vantanode-{vps_id}' > /etc/hostname && hostname vantanode-{vps_id}"
-        success, output = await run_docker_command(container_id, ["bash", "-c", hostname_cmd])
-        if not success:
-            logger.warning(f"Failed to set hostname: {output}")
-
-        # Set watermark
-        success, output = await run_docker_command(container_id, ["bash", "-c", f"echo '{WATERMARK}' > /etc/machine-info"])
-        if not success:
-            logger.warning(f"Could not set machine info: {output}")
-
-        # Clean up
-        cleanup_cmd = "apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*"
-        await run_docker_command(container_id, ["bash", "-c", cleanup_cmd])
-
-        if isinstance(status_msg, discord.Interaction):
-            await status_msg.followup.send("✅ VantaNode VPS setup completed!", ephemeral=True)
-        else:
-            await status_msg.edit(content="✅ VantaNode VPS setup completed!")
-            
-        return True, ssh_password, vps_id
-    except Exception as e:
-        error_msg = f"Setup failed: {str(e)}"
-        logger.error(error_msg)
-        if isinstance(status_msg, discord.Interaction):
-            await status_msg.followup.send(f"❌ {error_msg}", ephemeral=True)
-        else:
-            await status_msg.edit(content=f"❌ {error_msg}")
-        return False, None, None
-
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict
+import signal
+import sys
+
+# ==================== CONFIGURATION ====================
+TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your bot token
+PREFIX = "/"  # Using / for slash commands
+MAIN_ADMIN_ID = 1372237657207345183  # Your Discord ID (Main Admin)
+BOT_NAME = "VantaNodes"
+RAM_LIMIT = "2g"
+SERVER_LIMIT = 12
+LOGS_CHANNEL_ID = 123456789  # CHANGE THIS TO YOUR LOGS CHANNEL ID
+
+database_file = 'database.txt'
+admins_file = 'admins.json'
+
+# Modern Color Scheme
+EMBED_COLOR = 0x9B59B6  # Purple
+SUCCESS_COLOR = 0x00FF00  # Green
+ERROR_COLOR = 0xFF0000  # Red
+WARNING_COLOR = 0xFFA500  # Orange
+INFO_COLOR = 0x3498DB  # Blue
+
+# Modern Emojis
+EMOJI = {
+    'cpu': '🖥️', 'ram': '💾', 'disk': '💽', 'network': '🌐',
+    'online': '🟢', 'offline': '🔴', 'pending': '🟡',
+    'start': '▶️', 'stop': '⏹️', 'restart': '🔄',
+    'terminal': '💻', 'stats': '📊', 'time': '⏰',
+    'check': '✅', 'cross': '❌', 'warning': '⚠️',
+    'info': 'ℹ️', 'settings': '⚙️', 'database': '🗄️',
+    'server': '🖥️', 'vps': '🚀', 'admin': '👑',
+    'user': '👤', 'node': '🌐', 'location': '📍',
+    'power': '⚡', 'delete': '🗑️', 'edit': '✏️',
+    'list': '📋', 'help': '❓', 'about': 'ℹ️',
+    'ping': '📡', 'uptime': '⏱️', 'success': '✅',
+    'error': '❌', 'loading': '⏳', 'arrow': '➡️',
+    'folder': '📁', 'package': '📦', 'tool': '🛠️',
+    'shield': '🛡️', 'lock': '🔒', 'unlock': '🔓',
+    'search': '🔍', 'chart': '📈', 'bell': '🔔',
+    'star': '⭐', 'sparkle': '✨', 'fire': '🔥',
+    'heart': '❤️', 'reinstall': '🔄', 'ssh': '🔑',
+    'ip': '🌍', 'docker': '🐳', 'container': '📦',
+    'memory': '🧠', 'clock': '🕐', 'tmate': '🔌',
+    'globe': '🌎', 'id': '🆔', 'role': '🔰'
+}
+
+# OS Options with fancy emojis and descriptions
+OS_OPTIONS = {
+    "ubuntu": {
+        "image": "ubuntu-vps", 
+        "name": "Ubuntu 22.04", 
+        "emoji": "🐧",
+        "description": "Stable and widely-used Linux distribution"
+    },
+    "debian": {
+        "image": "debian-vps", 
+        "name": "Debian 12", 
+        "emoji": "🦕",
+        "description": "Rock-solid stability with large software repository"
+    },
+    "alpine": {
+        "image": "alpine-vps", 
+        "name": "Alpine Linux", 
+        "emoji": "⛰️",
+        "description": "Lightweight and security-focused"
+    },
+    "arch": {
+        "image": "arch-vps", 
+        "name": "Arch Linux", 
+        "emoji": "🎯",
+        "description": "Rolling release with bleeding-edge software"
+    },
+    "kali": {
+        "image": "kali-vps", 
+        "name": "Kali Linux", 
+        "emoji": "💣",
+        "description": "Penetration testing and security auditing"
+    },
+    "fedora": {
+        "image": "fedora-vps", 
+        "name": "Fedora", 
+        "emoji": "🎩",
+        "description": "Innovative features with Red Hat backing"
+    }
+}
+
+# Animation frames for different states
+LOADING_ANIMATION = ["🔄", "⚡", "✨", "🌀", "🌪️", "🌈"]
+SUCCESS_ANIMATION = ["✅", "🎉", "✨", "🌟", "💫", "🔥"]
+ERROR_ANIMATION = ["❌", "💥", "⚠️", "🚨", "🔴", "🛑"]
+DEPLOY_ANIMATION = ["🚀", "🛰️", "🌌", "🔭", "👨‍🚀", "🪐"]
+
+# ==================== BOT SETUP ====================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = VantaNodeBot(command_prefix='/', intents=intents, help_command=None)
 
-@bot.event
-async def on_ready():
-    logger.info(f'{bot.user} has connected to Discord!')
+class AdminBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix=commands.when_mentioned_or(PREFIX), intents=intents)
+        self.start_time = datetime.now()
+        self.main_admin_id = MAIN_ADMIN_ID
+        self.admins = set([MAIN_ADMIN_ID])
+        self.bot_name = BOT_NAME
+        
+        # Load admins from file
+        self.load_admins()
     
-    # Auto-start VPS containers based on status
-    if bot.docker_client:
-        for token, vps in bot.db.get_all_vps().items():
-            if vps['status'] == 'running':
-                try:
-                    container = bot.docker_client.containers.get(vps["container_id"])
-                    if container.status != "running":
-                        container.start()
-                        logger.info(f"Started container for VPS {vps['vps_id']}")
-                except docker.errors.NotFound:
-                    logger.warning(f"Container {vps['container_id']} not found")
-                except Exception as e:
-                    logger.error(f"Error starting container: {e}")
-    
-    try:
-        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.streaming, name="📊VantaNode│VPS 🚀Prefix '/' ⚡"))
-        synced_commands = await bot.tree.sync()
-        logger.info(f"Synced {len(synced_commands)} slash commands")
-    except Exception as e:
-        logger.error(f"Error syncing slash commands: {e}")
-
-@bot.hybrid_command(name='ping', description='Ping the bot latency')
-async def ping(ctx):
-    try:
-        latency = bot.latency * 1000
-        await ctx.send(f"Pong Latency: {latency:.2f} ms")
-    except Exception as e:
-        logger.error(f"Error in ping command: {e}")
-        await ctx.send("An error occurred.")
-
-@bot.hybrid_command(name='help', description='Show all commands')
-async def show_commands(ctx):
-    try:
-        embed = discord.Embed(title="🤖 VantaNode VPS Bot Commands", color=discord.Color.blue())
-        
-        embed.add_field(name="User Commands", value="""
-`/deploy` - Create VPS (Admin)
-`/list` - List your VPS
-`/ping` - Check latency
-`/help` - Show commands
-`/manage_vps <vps_id>` - Manage VPS
-`/transfer_vps <vps_id> <user>` - Transfer VPS
-`/vps_stats <vps_id>` - Show usage
-`/change_ssh_password <vps_id>` - Change SSH password
-`/vps_shell <vps_id>` - Get shell access
-`/vps_console <vps_id>` - Get console access
-`/vps_usage` - Show usage stats
-`/vps_uptime <vps_id>` - Show VPS uptime
-""", inline=False)
-        
-        if has_admin_role(ctx):
-            embed.add_field(name="Admin Commands", value="""
-`/list_all` - List all VPS
-`/delete_vps <vps_id>` - Delete VPS
-`/admin_stats` - Show system stats
-`/cleanup_vps` - Cleanup VPS
-`/add_admin <user>` - Add admin
-`/remove_admin <user>` - Remove admin
-`/list_admins` - List admins
-`/system_info` - System info
-`/container_limit <max>` - Set limit
-`/global_stats` - Global stats
-`/edit_vps <vps_id>` - Edit VPS
-`/ban_user <user>` - Ban user
-`/unban_user <user>` - Unban user
-`/list_banned` - List banned
-`/backup_data` - Backup data
-`/restore_data` - Restore data
-`/resource_stats` - Show resource allocation
-""", inline=False)
-        
-        await ctx.send(embed=embed)
-    except Exception as e:
-        logger.error(f"Error in show_commands: {e}")
-        await ctx.send("❌ An error occurred.")
-
-@bot.hybrid_command(name='deploy', description='Create VPS (Admin only)')
-@app_commands.describe(
-    memory="Memory in GB",
-    cpu="CPU cores",
-    disk="Disk in GB",
-    owner="Owner user",
-    os_image="OS image",
-    use_custom_image="Use custom image",
-    reason="Reason (optional)"
-)
-async def create_vps_command(
-    ctx,
-    memory: int,
-    cpu: int,
-    disk: int,
-    owner: discord.Member,
-    os_image: str = DEFAULT_OS_IMAGE,
-    use_custom_image: bool = True,
-    reason: Optional[str] = None
-):
-    """Create a VPS with dedicated resources"""
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-        if bot.db.is_user_banned(owner.id):
-            await ctx.send("❌ User banned!", ephemeral=True); return
-        if not ctx.guild:
-            await ctx.send("❌ Server only!", ephemeral=True); return
-
+    def load_admins(self):
+        """Load admins from JSON file"""
         try:
-            if not bot.docker_client:
-                bot.docker_client = docker.from_env()
-            bot.docker_client.ping()
-        except Exception:
-            await ctx.send("❌ Docker not available.", ephemeral=True)
-            return
-
-        if not (1 <= memory <= 512):
-            await ctx.send("❌ Memory 1-512GB", ephemeral=True); return
-        if not (1 <= cpu <= 32):
-            await ctx.send("❌ CPU 1-32 cores", ephemeral=True); return
-        if not (10 <= disk <= 1000):
-            await ctx.send("❌ Disk 10-1000GB", ephemeral=True); return
-
-        containers = bot.docker_client.containers.list(all=True)
-        if len(containers) >= bot.db.get_setting('max_containers', MAX_CONTAINERS):
-            await ctx.send(f"❌ Max containers reached ({bot.db.get_setting('max_containers')}).", ephemeral=True)
-            return
-        if bot.db.get_user_vps_count(owner.id) >= bot.db.get_setting('max_vps_per_user', MAX_VPS_PER_USER):
-            await ctx.send(f"❌ {owner.mention} has max VPS.", ephemeral=True)
-            return
-
-        status_msg = await ctx.send("🚀 Creating VantaNode VPS...")
-
-        # Allocate CPU cores
-        try:
-            cpuset_cpus = allocate_cpu_cores(cpu)
+            if os.path.exists(admins_file):
+                with open(admins_file, 'r') as f:
+                    data = json.load(f)
+                    self.admins = set(data.get('admins', [MAIN_ADMIN_ID]))
+                    print(f"✅ Loaded {len(self.admins)} admins")
         except Exception as e:
-            await status_msg.edit(content=f"❌ {str(e)}")
+            print(f"⚠️ Error loading admins: {e}")
+    
+    def save_admins(self):
+        """Save admins to JSON file"""
+        try:
+            data = {'admins': list(self.admins)}
+            with open(admins_file, 'w') as f:
+                json.dump(data, f, indent=4)
+            print(f"✅ Saved {len(self.admins)} admins")
+        except Exception as e:
+            print(f"⚠️ Error saving admins: {e}")
+
+bot = AdminBot()
+
+# ==================== HELPER FUNCTIONS ====================
+
+def is_admin(user_id: int) -> bool:
+    """Check if user is admin"""
+    return user_id in bot.admins or user_id == bot.main_admin_id
+
+def is_main_admin(user_id: int) -> bool:
+    """Check if user is main admin"""
+    return user_id == bot.main_admin_id
+
+def create_embed(title, description=None, color=EMBED_COLOR, fields=None, footer=None, thumbnail=None):
+    """Create a formatted embed"""
+    embed = discord.Embed(
+        title=f"{EMOJI['vps']} {title}",
+        description=description,
+        color=color,
+        timestamp=datetime.now()
+    )
+    
+    embed.set_author(name=bot.bot_name)
+    
+    if fields:
+        for name, value, inline in fields:
+            embed.add_field(name=name, value=value, inline=inline)
+    
+    if footer:
+        embed.set_footer(text=footer)
+    else:
+        embed.set_footer(text=f"{bot.bot_name} • Admin Managed")
+    
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
+    
+    return embed
+
+def generate_random_port():
+    return random.randint(1025, 65535)
+
+def add_to_database(user, container_name, ssh_command):
+    with open(database_file, 'a') as f:
+        f.write(f"{user}|{container_name}|{ssh_command}\n")
+
+def remove_from_database(ssh_command):
+    if not os.path.exists(database_file):
+        return
+    with open(database_file, 'r') as f:
+        lines = f.readlines()
+    with open(database_file, 'w') as f:
+        for line in lines:
+            if ssh_command not in line:
+                f.write(line)
+
+def remove_container_from_database_by_id(container_id):
+    if not os.path.exists(database_file):
+        return
+    with open(database_file, 'r') as f:
+        lines = f.readlines()
+    with open(database_file, 'w') as f:
+        for line in lines:
+            parts = line.strip().split('|')
+            if len(parts) < 2 or parts[1] != container_id:
+                f.write(line)
+
+def get_container_info_by_id(container_id):
+    if not os.path.exists(database_file):
+        return None, None, None
+    with open(database_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split('|')
+            if len(parts) >= 3 and parts[1].startswith(container_id):
+                return parts[0], parts[1], parts[2]
+    return None, None, None
+
+def get_user_servers(user):
+    if not os.path.exists(database_file):
+        return []
+    servers = []
+    with open(database_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split('|')
+            if len(parts) >= 3 and parts[0] == user:
+                servers.append(line.strip())
+    return servers
+
+def get_all_servers():
+    if not os.path.exists(database_file):
+        return []
+    servers = []
+    with open(database_file, 'r') as f:
+        for line in f:
+            servers.append(line.strip())
+    return servers
+
+def count_user_servers(user):
+    return len(get_user_servers(user))
+
+async def capture_ssh_session_line(process):
+    while True:
+        output = await process.stdout.readline()
+        if not output:
+            break
+        output = output.decode('utf-8').strip()
+        if "ssh session:" in output:
+            return output.split("ssh session:")[1].strip()
+    return None
+
+def get_system_resources():
+    try:
+        cpu_percent = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory()
+        mem_total = mem.total / (1024 ** 3)
+        mem_used = mem.used / (1024 ** 3)
+        disk = psutil.disk_usage('/')
+        disk_total = disk.total / (1024 ** 3)
+        disk_used = disk.used / (1024 ** 3)
+        
+        return {
+            'cpu': cpu_percent,
+            'memory': {'total': round(mem_total, 2), 'used': round(mem_used, 2), 'percent': mem.percent},
+            'disk': {'total': round(disk_total, 2), 'used': round(disk_used, 2), 'percent': disk.percent}
+        }
+    except Exception:
+        return {
+            'cpu': 0,
+            'memory': {'total': 0, 'used': 0, 'percent': 0},
+            'disk': {'total': 0, 'used': 0, 'percent': 0}
+        }
+
+def get_container_stats():
+    """Get CPU and memory usage for all running containers."""
+    try:
+        stats_raw = subprocess.check_output(
+            ["docker", "stats", "--no-stream", "--format", "{{.ID}}|{{.CPUPerc}}|{{.MemUsage}}"],
+            text=True
+        ).strip().split('\n')
+        
+        stats = {}
+        for line in stats_raw:
+            parts = line.split('|')
+            if len(parts) >= 3:
+                container_id = parts[0]
+                cpu_percent = parts[1].strip()
+                mem_usage_raw = parts[2].strip()
+
+                mem_match = re.match(r"(\d+(\.\d+)?\w+)\s+/\s+(\d+(\.\d+)?\w+)", mem_usage_raw)
+                
+                mem_used = 'N/A'
+                mem_limit = 'N/A'
+                
+                if mem_match:
+                    mem_used = mem_match.group(1)
+                    mem_limit = mem_match.group(3)
+                else:
+                    mem_used = '0B'
+                    mem_limit = '0B'
+
+                stats[container_id] = {
+                    'cpu': cpu_percent,
+                    'mem_used': mem_used,
+                    'mem_limit': mem_limit
+                }
+        return stats
+    except Exception as e:
+        print(f"Error getting container stats: {e}")
+        return {}
+
+async def send_to_logs(message):
+    try:
+        channel = bot.get_channel(LOGS_CHANNEL_ID)
+        if channel:
+            perms = channel.permissions_for(channel.guild.me)
+            if perms.send_messages:
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                await channel.send(f"`[{timestamp}]` {message}")
+    except Exception as e:
+        print(f"Failed to send logs: {e}")
+
+# ==================== ADMIN MANAGEMENT ====================
+
+class AdminView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+    
+    @discord.ui.button(label="Add Admin", style=discord.ButtonStyle.success, emoji="👑", custom_id="add_admin")
+    async def add_admin_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_main_admin(interaction.user.id):
+            await interaction.response.send_message(f"{EMOJI['error']} Only the main admin can use this!", ephemeral=True)
             return
+        
+        modal = AdminAddModal()
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="Remove Admin", style=discord.ButtonStyle.danger, emoji="👤", custom_id="remove_admin")
+    async def remove_admin_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_main_admin(interaction.user.id):
+            await interaction.response.send_message(f"{EMOJI['error']} Only the main admin can use this!", ephemeral=True)
+            return
+        
+        modal = AdminRemoveModal()
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="List Admins", style=discord.ButtonStyle.primary, emoji="📋", custom_id="list_admins")
+    async def list_admins_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user.id):
+            await interaction.response.send_message(f"{EMOJI['error']} You are not an admin!", ephemeral=True)
+            return
+        
+        admin_list = []
+        for admin_id in bot.admins:
+            user = await bot.fetch_user(admin_id)
+            if user:
+                admin_list.append(f"{EMOJI['admin']} {user.mention} (`{admin_id}`)")
+        
+        main_admin = await bot.fetch_user(bot.main_admin_id)
+        
+        embed = create_embed(
+            "👑 Admin List",
+            color=EMBED_COLOR,
+            fields=[
+                (f"{EMOJI['star']} **Main Admin**", f"{main_admin.mention} (`{bot.main_admin_id}`)", False),
+                (f"{EMOJI['admin']} **Admins ({len(admin_list)})**", "\n".join(admin_list) if admin_list else "No additional admins", False)
+            ]
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        vps_id = generate_vps_id()
-        username = owner.name.lower().replace(" ", "_")[:20]
-        root_password = generate_ssh_password()
-        user_password = generate_ssh_password()
-        token = generate_token()
-
+class AdminAddModal(discord.ui.Modal, title="Add Admin"):
+    user_id = discord.ui.TextInput(
+        label="User ID",
+        placeholder="Enter the Discord user ID...",
+        required=True
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
         try:
-            # Create Docker network if not exists
-            nets = subprocess.run(
-                ["docker","network","ls","--format","{{.Name}}"],
-                capture_output=True, text=True
-            ).stdout.splitlines()
-            if DOCKER_NETWORK not in nets:
-                subprocess.run(["docker","network","create", DOCKER_NETWORK], check=False)
-        except Exception:
-            pass
-
-        try:
-            # Build or pull image
-            if use_custom_image:
-                await status_msg.edit(content="🚀 Building VantaNode image...")
-                image_tag = await build_custom_image(
-                    vps_id, username, root_password, user_password, os_image
-                )
-            else:
-                # Pull base image
-                await status_msg.edit(content="📥 Pulling base image...")
-                bot.docker_client.images.pull(os_image)
-                image_tag = os_image
-        except docker.errors.ImageNotFound:
-            await status_msg.edit(content=f"❌ Image not found. Using default {DEFAULT_OS_IMAGE}")
-            try:
-                bot.docker_client.images.pull(DEFAULT_OS_IMAGE)
-                image_tag = DEFAULT_OS_IMAGE
-                os_image = DEFAULT_OS_IMAGE
-            except Exception as e:
-                await status_msg.edit(content=f"❌ Failed to pull default image: {e}")
-                free_cpu_cores(cpuset_cpus)
+            user_id = int(self.user_id.value)
+            user = await bot.fetch_user(user_id)
+            
+            if user_id in bot.admins:
+                await interaction.response.send_message(f"{EMOJI['warning']} User is already an admin!", ephemeral=True)
                 return
-        except Exception as e:
-            await status_msg.edit(content=f"❌ Failed to get image: {e}")
-            free_cpu_cores(cpuset_cpus)
-            return
-
-        # Create container with dedicated resources
-        await status_msg.edit(content="⚙️ Creating container with dedicated resources...")
-        try:
-            # Create volume for disk space
-            volume_name = f"vantanode-{vps_id}-disk"
-            try:
-                bot.docker_client.volumes.create(
-                    name=volume_name,
-                    driver="local",
-                    driver_opts={"type": "tmpfs", "device": "tmpfs", "o": f"size={disk}g"}
-                )
-            except docker.errors.APIError:
-                # Volume might already exist
-                pass
-
-            # Create container with resource limits
-            container = bot.docker_client.containers.run(
-                image_tag,
-                command="/usr/sbin/sshd -D" if use_custom_image else "/bin/bash -c 'while true; do sleep 86400; done'",
-                detach=True,
-                privileged=True,
-                hostname=f"vantanode-{vps_id}",
-                # Memory limits
-                mem_limit=f"{memory}g",
-                memswap_limit=f"{memory}g",  # Equal to memory = no swap
-                mem_swappiness=0,
-                # CPU limits
-                cpuset_cpus=cpuset_cpus,
-                cpu_period=100000,
-                cpu_quota=int(cpu * 100000),
-                cpu_shares=1024 * cpu,
-                # Disk limits
-                storage_opt={"size": f"{disk}G"},
-                # Network
-                network=DOCKER_NETWORK,
-                # Mount disk volume
-                volumes={volume_name: {'bind': '/', 'mode': 'rw'}},
-                # Restart policy
-                restart_policy={"Name": "always", "MaximumRetryCount": 3},
-                name=f"vantanode-{vps_id}",
-                # Resource isolation
-                ulimits=[
-                    docker.types.Ulimit(name='nofile', soft=65536, hard=65536),
-                    docker.types.Ulimit(name='nproc', soft=65536, hard=65536),
-                ]
+            
+            bot.admins.add(user_id)
+            bot.save_admins()
+            
+            embed = create_embed(
+                "✅ Admin Added",
+                f"{EMOJI['admin']} {user.mention} has been added as an admin.",
+                color=SUCCESS_COLOR
             )
+            await interaction.response.send_message(embed=embed)
+            await send_to_logs(f"👑 {interaction.user.mention} added {user.mention} as admin")
+            
+        except ValueError:
+            await interaction.response.send_message(f"{EMOJI['error']} Invalid user ID!", ephemeral=True)
         except Exception as e:
-            await status_msg.edit(content=f"❌ Failed to create container: {e}")
-            free_cpu_cores(cpuset_cpus)
-            return
+            await interaction.response.send_message(f"{EMOJI['error']} Error: {str(e)}", ephemeral=True)
 
-        # Setup container
-        await status_msg.edit(content="🔧 Setting up VPS...")
-        setup_success, ssh_password, final_vps_id = await setup_container(
-            container.id, status_msg, memory, username, vps_id=vps_id, use_custom_image=use_custom_image
+class AdminRemoveModal(discord.ui.Modal, title="Remove Admin"):
+    user_id = discord.ui.TextInput(
+        label="User ID",
+        placeholder="Enter the Discord user ID...",
+        required=True
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user_id = int(self.user_id.value)
+            
+            if user_id == bot.main_admin_id:
+                await interaction.response.send_message(f"{EMOJI['error']} Cannot remove the main admin!", ephemeral=True)
+                return
+            
+            if user_id not in bot.admins:
+                await interaction.response.send_message(f"{EMOJI['warning']} User is not an admin!", ephemeral=True)
+                return
+            
+            user = await bot.fetch_user(user_id)
+            bot.admins.remove(user_id)
+            bot.save_admins()
+            
+            embed = create_embed(
+                "✅ Admin Removed",
+                f"{EMOJI['user']} {user.mention} has been removed from admins.",
+                color=SUCCESS_COLOR
+            )
+            await interaction.response.send_message(embed=embed)
+            await send_to_logs(f"👤 {interaction.user.mention} removed {user.mention} from admins")
+            
+        except ValueError:
+            await interaction.response.send_message(f"{EMOJI['error']} Invalid user ID!", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"{EMOJI['error']} Error: {str(e)}", ephemeral=True)
+
+# ==================== COMMANDS ====================
+
+@bot.tree.command(name="admin", description="👑 Admin management panel")
+async def admin_command(interaction: discord.Interaction):
+    """Open admin management panel"""
+    if not is_admin(interaction.user.id):
+        embed = create_embed(
+            "🚫 Permission Denied",
+            f"{EMOJI['warning']} You are not an admin!",
+            color=ERROR_COLOR
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
+    embed = create_embed(
+        "👑 Admin Management",
+        "Use the buttons below to manage administrators.",
+        color=EMBED_COLOR
+    )
+    await interaction.response.send_message(embed=embed, view=AdminView(), ephemeral=True)
+
+@bot.tree.command(name="admins", description="📋 List all admins")
+async def list_admins_command(interaction: discord.Interaction):
+    """List all admins"""
+    admin_list = []
+    for admin_id in bot.admins:
+        user = await bot.fetch_user(admin_id)
+        if user:
+            admin_list.append(f"{EMOJI['admin']} {user.mention} (`{admin_id}`)")
+    
+    main_admin = await bot.fetch_user(bot.main_admin_id)
+    
+    embed = create_embed(
+        "👑 Admin List",
+        color=EMBED_COLOR,
+        fields=[
+            (f"{EMOJI['star']} **Main Admin**", f"{main_admin.mention} (`{bot.main_admin_id}`)", False),
+            (f"{EMOJI['admin']} **Admins ({len(admin_list)})**", "\n".join(admin_list) if admin_list else "No additional admins", False)
+        ]
+    )
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="deploy", description="🚀 [ADMIN] Create a new cloud instance for a user")
+@app_commands.describe(
+    user="The user to deploy for",
+    os="The OS to deploy (ubuntu, debian, alpine, arch, kali, fedora)"
+)
+async def deploy(interaction: discord.Interaction, user: discord.User, os: str):
+    """Deploy a new VPS (Admin only)"""
+    if not is_admin(interaction.user.id):
+        embed = create_embed(
+            "🚫 Permission Denied",
+            f"{EMOJI['warning']} This command is restricted to administrators only.",
+            color=ERROR_COLOR
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    os = os.lower()
+    if os not in OS_OPTIONS:
+        valid_oses = "\n".join([f"{OS_OPTIONS[os_id]['emoji']} **{os_id}** - {OS_OPTIONS[os_id]['description']}" 
+                               for os_id in OS_OPTIONS.keys()])
+        embed = create_embed(
+            "❌ Invalid OS Selection",
+            f"**Available OS options:**\n{valid_oses}",
+            color=ERROR_COLOR
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    os_data = OS_OPTIONS[os]
+    
+    # Check server limit
+    if count_user_servers(str(user)) >= SERVER_LIMIT:
+        embed = create_embed(
+            "❌ Server Limit Reached",
+            f"{EMOJI['warning']} User already has {SERVER_LIMIT} servers!",
+            color=ERROR_COLOR
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
+    # Initial response
+    embed = create_embed(
+        f"🚀 Deploying {os_data['emoji']} {os_data['name']}",
+        f"Creating instance for {user.mention}...\n"
+        f"```RAM: {RAM_LIMIT}\nAuto-Delete: 4h Inactivity```",
+        color=EMBED_COLOR,
+        footer="This may take 1-2 minutes..."
+    )
+    await interaction.response.send_message(embed=embed)
+    msg = await interaction.original_response()
+
+    try:
+        # Create container
+        embed.description = "```diff\n+ Pulling container image from repository...\n```"
+        await msg.edit(embed=embed)
+        
+        container_id = subprocess.check_output(
+            ["docker", "run", "-itd", "--privileged", os_data["image"]]
+        ).strip().decode('utf-8')
+        
+        await send_to_logs(f"🔧 {interaction.user.mention} deployed {os_data['emoji']} {os_data['name']} for {user.mention} (ID: `{container_id[:12]}`)")
+        
+        # Setup SSH
+        embed.description = "```diff\n+ Configuring SSH access and security...\n```"
+        await msg.edit(embed=embed)
+
+        exec_cmd = await asyncio.create_subprocess_exec(
+            "docker", "exec", container_id, "tmate", "-F",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
         
-        if not setup_success:
-            try:
-                container.stop()
-                container.remove(v=True)
-            except Exception:
-                pass
-            free_cpu_cores(cpuset_cpus)
-            await status_msg.edit(content="❌ Setup failed.")
-            return
-
-        # Get tmate session
-        await status_msg.edit(content="🔐 Starting session...")
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "docker", "exec", container.id, "tmate", "-F",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            ssh_session_line = await capture_ssh_session_line(proc)
-            if not ssh_session_line:
-                raise Exception("Failed to get SSH session")
-        except Exception as e:
-            await status_msg.edit(content=f"❌ Failed to start session: {e}")
-            try:
-                container.stop()
-                container.remove(v=True)
-            except Exception:
-                pass
-            free_cpu_cores(cpuset_cpus)
-            return
-
-        # Save VPS data
-        vps_data = {
-            "token": token,
-            "vps_id": final_vps_id,
-            "container_id": container.id,
-            "memory": memory,
-            "cpu": cpu,
-            "disk": disk,
-            "username": username,
-            "password": ssh_password,
-            "root_password": root_password if use_custom_image else None,
-            "created_by": str(owner.id),
-            "created_at": datetime.datetime.now().isoformat(),
-            "tmate_session": ssh_session_line,
-            "watermark": WATERMARK,
-            "os_image": os_image,
-            "restart_count": 0,
-            "last_restart": None,
-            "status": "running",
-            "use_custom_image": use_custom_image,
-            "allocated_cpus": cpuset_cpus,
-            "uptime_start": datetime.datetime.now().isoformat(),
-            "total_uptime": 0
-        }
-        bot.db.add_vps(vps_data)
+        ssh_session_line = await capture_ssh_session_line(exec_cmd)
         
-        # Update uptime tracker
-        VPS_UPTIME_TRACKER[final_vps_id] = {
-            'start_time': datetime.datetime.now(),
-            'container_id': container.id
-        }
-
-        # Send success message
-        try:
-            embed = discord.Embed(title="🎉 VantaNode VPS Created", color=discord.Color.green())
-            embed.add_field(name="VPS ID", value=final_vps_id, inline=True)
-            embed.add_field(name="Memory", value=f"{memory}GB", inline=True)
-            embed.add_field(name="CPU Cores", value=f"{cpu} cores", inline=True)
-            embed.add_field(name="Disk", value=f"{disk}GB", inline=True)
-            embed.add_field(name="CPU Isolation", value=cpuset_cpus, inline=True)
-            if reason:
-                embed.add_field(name="Reason", value=reason[:1024], inline=False)
-            embed.add_field(name="Username", value=username, inline=True)
-            embed.add_field(name="Password", value=f"||{ssh_password}||", inline=False)
-            if use_custom_image:
-                embed.add_field(name="Root Password", value=f"||{root_password}||", inline=False)
-            embed.add_field(name="Session", value=f"```{ssh_session_line}```", inline=False)
-            embed.add_field(name="SSH", value=f"```ssh {username}@<server>```", inline=False)
-
-            await owner.send(embed=embed)
-            await status_msg.edit(
-                content=f"✅ VPS created for {owner.mention}. Check DMs."
+        if ssh_session_line:
+            # Success - send to admin and user
+            admin_embed = create_embed(
+                f"🎉 {os_data['emoji']} {os_data['name']} Instance Ready!",
+                f"**Successfully deployed for {user.mention}**\n\n"
+                f"**🔑 SSH Command:**\n```{ssh_session_line}```",
+                color=SUCCESS_COLOR,
+                fields=[
+                    ("📦 Container Info", f"```ID: {container_id[:12]}\nOS: {os_data['name']}\nStatus: Running```", False)
+                ],
+                footer="💎 This instance will auto-delete after 4 hours of inactivity"
             )
-        except discord.Forbidden:
-            await status_msg.edit(
-                content=f"✅ VPS created for {owner.mention}. Enable DMs for credentials."
+            await interaction.followup.send(embed=admin_embed, ephemeral=True)
+            
+            try:
+                user_embed = create_embed(
+                    f"✨ Your {os_data['name']} Instance is Ready!",
+                    f"**SSH Access Details:**\n```{ssh_session_line}```\n\nDeployed by: {interaction.user.mention}",
+                    color=EMBED_COLOR,
+                    fields=[
+                        ("💡 Getting Started", "```Connect using any SSH client\nUsername: root\nNo password required```", False)
+                    ],
+                    footer="💎 This instance will auto-delete after 4 hours of inactivity"
+                )
+                await user.send(embed=user_embed)
+            except discord.Forbidden:
+                pass
+            
+            add_to_database(str(user), container_id, ssh_session_line)
+            
+            # Final success message
+            embed = create_embed(
+                f"✅ Deployment Complete! {random.choice(SUCCESS_ANIMATION)}",
+                f"**{os_data['emoji']} {os_data['name']}** instance created for {user.mention}!",
+                color=SUCCESS_COLOR
             )
-
+            await msg.edit(embed=embed)
+        else:
+            embed = create_embed(
+                f"⚠️ Timeout {random.choice(ERROR_ANIMATION)}",
+                "```diff\n- SSH configuration timed out...\n- Rolling back deployment\n```",
+                color=WARNING_COLOR
+            )
+            await msg.edit(embed=embed)
+            subprocess.run(["docker", "kill", container_id], stderr=subprocess.DEVNULL)
+            subprocess.run(["docker", "rm", container_id], stderr=subprocess.DEVNULL)
+            
+    except subprocess.CalledProcessError as e:
+        embed = create_embed(
+            f"❌ Deployment Failed {random.choice(ERROR_ANIMATION)}",
+            f"```diff\n- Error during deployment:\n{e}\n```",
+            color=ERROR_COLOR
+        )
+        await msg.edit(embed=embed)
+        await send_to_logs(f"💥 Deployment failed for {user.mention} by {interaction.user.mention}: {e}")
+        
     except Exception as e:
-        logger.error(f"deploy error: {e}")
-        await ctx.send(f"❌ Error: {e}")
+        print(f"Error in deploy command: {e}")
+        embed = create_embed(
+            "💥 Critical Error",
+            "```diff\n- An unexpected error occurred\n- Please try again later\n```",
+            color=ERROR_COLOR
+        )
+        await msg.edit(embed=embed)
+
+@bot.tree.command(name="start", description="🟢 Start your cloud instance")
+@app_commands.describe(container_id="Your instance ID (first 4+ characters)")
+async def start_server(interaction: discord.Interaction, container_id: str):
+    """Start a VPS"""
+    try:
+        user = str(interaction.user)
+        container_info = None
+        ssh_command = None
+        
+        if not os.path.exists(database_file):
+            embed = create_embed(
+                "📭 No Instances Found",
+                "You don't have any active instances!",
+                color=INFO_COLOR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        with open(database_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split('|')
+                if len(parts) >= 3 and user == parts[0] and container_id in parts[1]:
+                    container_info = parts[1]
+                    ssh_command = parts[2]
+                    break
+
+        if not container_info:
+            embed = create_embed(
+                "🔍 Instance Not Found",
+                "No instance found with that ID that belongs to you!",
+                color=INFO_COLOR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        embed = create_embed(
+            f"🔌 Starting Instance {container_info[:12]}",
+            "```diff\n+ Powering up your cloud instance...\n```",
+            color=EMBED_COLOR
+        )
+        await interaction.response.send_message(embed=embed)
+        msg = await interaction.original_response()
+
         try:
-            if 'container' in locals():
-                try:
-                    container.stop()
-                    container.remove(v=True)
-                except Exception:
-                    pass
-            if 'cpuset_cpus' in locals():
-                free_cpu_cores(cpuset_cpus)
-        except Exception:
+            check_cmd = subprocess.run(
+                ["docker", "inspect", "--format='{{.State.Status}}'", container_info],
+                capture_output=True, text=True
+            )
+            
+            if check_cmd.returncode != 0:
+                embed = create_embed(
+                    "❌ Container Not Found",
+                    f"Container `{container_info[:12]}` doesn't exist in Docker!",
+                    color=ERROR_COLOR
+                )
+                await msg.edit(embed=embed)
+                remove_from_database(ssh_command)
+                return
+            
+            subprocess.run(["docker", "start", container_info], check=True)
+            
+            try:
+                embed.description = "```diff\n+ Generating new SSH connection...\n```"
+                await msg.edit(embed=embed)
+                
+                exec_cmd = await asyncio.create_subprocess_exec(
+                    "docker", "exec", container_info, "tmate", "-F",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                ssh_session_line = await capture_ssh_session_line(exec_cmd)
+                
+                if ssh_session_line:
+                    remove_from_database(ssh_command)
+                    add_to_database(user, container_info, ssh_session_line)
+                    
+                    try:
+                        dm_embed = create_embed(
+                            f"🟢 Instance Started {random.choice(SUCCESS_ANIMATION)}",
+                            f"**Your instance is now running!**\n\n**🔑 New SSH Command:**\n```{ssh_session_line}```",
+                            color=SUCCESS_COLOR,
+                            fields=[("💡 Note", "The old SSH connection is no longer valid", False)]
+                        )
+                        await interaction.user.send(embed=dm_embed)
+                    except discord.Forbidden:
+                        pass
+                    
+                    embed = create_embed(
+                        f"🟢 Instance Started {random.choice(SUCCESS_ANIMATION)}",
+                        f"Instance `{container_info[:12]}` is now running!\n📩 Check your DMs for new connection details.",
+                        color=SUCCESS_COLOR
+                    )
+                else:
+                    embed = create_embed(
+                        "⚠️ SSH Refresh Failed",
+                        f"Instance `{container_info[:12]}` started but couldn't get new SSH details.",
+                        color=WARNING_COLOR
+                    )
+            except Exception as e:
+                print(f"Error getting new SSH session: {e}")
+                embed = create_embed(
+                    "🟢 Instance Started",
+                    f"Instance `{container_info[:12]}` is running!\n⚠️ Could not refresh SSH details.",
+                    color=WARNING_COLOR
+                )
+            
+            await msg.edit(embed=embed)
+            await send_to_logs(f"🟢 {interaction.user.mention} started instance `{container_info[:12]}`")
+            
+        except subprocess.CalledProcessError as e:
+            embed = create_embed(
+                f"❌ Startup Failed {random.choice(ERROR_ANIMATION)}",
+                f"```diff\n- Error starting container:\n{e.stderr if e.stderr else e.stdout}\n```",
+                color=ERROR_COLOR
+            )
+            await msg.edit(embed=embed)
+            
+    except Exception as e:
+        print(f"Error in start_server: {e}")
+        try:
+            await interaction.followup.send(
+                embed=create_embed("❌ Error", "An error occurred while processing your request.", color=ERROR_COLOR),
+                ephemeral=True
+            )
+        except:
             pass
 
-@bot.hybrid_command(name='list', description='List your VPS')
-async def list_vps(ctx):
-    """List VPS instances owned by user"""
+@bot.tree.command(name="stop", description="🛑 Stop your cloud instance")
+@app_commands.describe(container_id="Your instance ID (first 4+ characters)")
+async def stop_server(interaction: discord.Interaction, container_id: str):
+    """Stop a VPS"""
     try:
-        user_vps = bot.db.get_user_vps(ctx.author.id)
+        user = str(interaction.user)
+        container_info = None
         
-        if not user_vps:
-            await ctx.send("❌ No VPS found.", ephemeral=True)
+        if not os.path.exists(database_file):
+            embed = create_embed(
+                "📭 No Instances Found",
+                "You don't have any active instances!",
+                color=INFO_COLOR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        embed = discord.Embed(title="Your VantaNode VPS", color=discord.Color.blue())
-        
-        for vps in user_vps:
-            try:
-                if vps["container_id"]:
-                    container = bot.docker_client.containers.get(vps["container_id"])
-                    status = container.status.capitalize()
-                else:
-                    status = "Unknown"
-            except Exception:
-                status = vps.get('status', 'Unknown').capitalize()
+        with open(database_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split('|')
+                if len(parts) >= 3 and user == parts[0] and container_id in parts[1]:
+                    container_info = parts[1]
+                    break
 
-            # Calculate uptime
-            uptime_seconds = vps.get('total_uptime', 0)
-            if vps['vps_id'] in VPS_UPTIME_TRACKER:
-                current_uptime = (datetime.datetime.now() - VPS_UPTIME_TRACKER[vps['vps_id']]['start_time']).total_seconds()
-                uptime_seconds += int(current_uptime)
+        if not container_info:
+            embed = create_embed(
+                "🔍 Instance Not Found",
+                "No instance found with that ID that belongs to you!",
+                color=INFO_COLOR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        embed = create_embed(
+            f"⏳ Stopping Instance {container_info[:12]}",
+            "```diff\n+ Shutting down your cloud instance...\n```",
+            color=EMBED_COLOR
+        )
+        await interaction.response.send_message(embed=embed)
+        msg = await interaction.original_response()
+
+        try:
+            check_cmd = subprocess.run(
+                ["docker", "inspect", container_info],
+                capture_output=True, text=True
+            )
             
-            uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
+            if check_cmd.returncode != 0:
+                embed = create_embed(
+                    "❌ Container Not Found",
+                    f"Container `{container_info[:12]}` doesn't exist in Docker!",
+                    color=ERROR_COLOR
+                )
+                await msg.edit(embed=embed)
+                remove_from_database(container_info)
+                return
             
+            subprocess.run(["docker", "stop", container_info], check=True)
+            
+            embed = create_embed(
+                f"🛑 Instance Stopped {random.choice(SUCCESS_ANIMATION)}",
+                f"Instance `{container_info[:12]}` has been successfully stopped!",
+                color=SUCCESS_COLOR
+            )
+            await msg.edit(embed=embed)
+            await send_to_logs(f"🛑 {interaction.user.mention} stopped instance `{container_info[:12]}`")
+            
+        except subprocess.CalledProcessError as e:
+            embed = create_embed(
+                f"❌ Stop Failed {random.choice(ERROR_ANIMATION)}",
+                f"```diff\n- Error stopping container:\n{e.stderr if e.stderr else e.stdout}\n```",
+                color=ERROR_COLOR
+            )
+            await msg.edit(embed=embed)
+            
+    except Exception as e:
+        print(f"Error in stop_server: {e}")
+        try:
+            await interaction.followup.send(
+                embed=create_embed("❌ Error", "An error occurred while processing your request.", color=ERROR_COLOR),
+                ephemeral=True
+            )
+        except:
+            pass
+
+@bot.tree.command(name="restart", description="🔄 Restart your cloud instance")
+@app_commands.describe(container_id="Your instance ID (first 4+ characters)")
+async def restart_server(interaction: discord.Interaction, container_id: str):
+    """Restart a VPS"""
+    try:
+        user = str(interaction.user)
+        container_info = None
+        ssh_command = None
+        
+        if not os.path.exists(database_file):
+            embed = create_embed(
+                "📭 No Instances Found",
+                "You don't have any active instances!",
+                color=INFO_COLOR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        with open(database_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split('|')
+                if len(parts) >= 3 and user == parts[0] and container_id in parts[1]:
+                    container_info = parts[1]
+                    ssh_command = parts[2]
+                    break
+
+        if not container_info:
+            embed = create_embed(
+                "🔍 Instance Not Found",
+                "No instance found with that ID that belongs to you!",
+                color=INFO_COLOR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        embed = create_embed(
+            f"🔄 Restarting Instance {container_info[:12]}",
+            "```diff\n+ Rebooting your cloud instance...\n```",
+            color=EMBED_COLOR
+        )
+        await interaction.response.send_message(embed=embed)
+        msg = await interaction.original_response()
+
+        try:
+            check_cmd = subprocess.run(
+                ["docker", "inspect", container_info],
+                capture_output=True, text=True
+            )
+            
+            if check_cmd.returncode != 0:
+                embed = create_embed(
+                    "❌ Container Not Found",
+                    f"Container `{container_info[:12]}` doesn't exist in Docker!",
+                    color=ERROR_COLOR
+                )
+                await msg.edit(embed=embed)
+                remove_from_database(ssh_command)
+                return
+            
+            subprocess.run(["docker", "restart", container_info], check=True)
+            
+            embed.description = "```diff\n+ Generating new SSH connection...\n```"
+            await msg.edit(embed=embed)
+            
+            try:
+                exec_cmd = await asyncio.create_subprocess_exec(
+                    "docker", "exec", container_info, "tmate", "-F",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                ssh_session_line = await capture_ssh_session_line(exec_cmd)
+                
+                if ssh_session_line:
+                    remove_from_database(ssh_command)
+                    add_to_database(user, container_info, ssh_session_line)
+                    
+                    try:
+                        dm_embed = create_embed(
+                            f"🔄 Instance Restarted {random.choice(SUCCESS_ANIMATION)}",
+                            f"**Your instance has been restarted!**\n\n**🔑 New SSH Command:**\n```{ssh_session_line}```",
+                            color=SUCCESS_COLOR,
+                            fields=[("💡 Note", "The old SSH connection is no longer valid", False)]
+                        )
+                        await interaction.user.send(embed=dm_embed)
+                    except discord.Forbidden:
+                        pass
+                    
+                    embed = create_embed(
+                        f"🔄 Instance Restarted {random.choice(SUCCESS_ANIMATION)}",
+                        f"Instance `{container_info[:12]}` has been restarted!\n📩 Check your DMs for new connection details.",
+                        color=SUCCESS_COLOR
+                    )
+                else:
+                    embed = create_embed(
+                        "⚠️ SSH Refresh Failed",
+                        f"Instance `{container_info[:12]}` restarted but couldn't get new SSH details.",
+                        color=WARNING_COLOR
+                    )
+            except Exception as e:
+                print(f"Error getting new SSH session: {e}")
+                embed = create_embed(
+                    "🔄 Instance Restarted",
+                    f"Instance `{container_info[:12]}` has been restarted!\n⚠️ Could not refresh SSH details.",
+                    color=WARNING_COLOR
+                )
+            
+            await msg.edit(embed=embed)
+            await send_to_logs(f"🔄 {interaction.user.mention} restarted instance `{container_info[:12]}`")
+            
+        except subprocess.CalledProcessError as e:
+            embed = create_embed(
+                f"❌ Restart Failed {random.choice(ERROR_ANIMATION)}",
+                f"```diff\n- Error restarting container:\n{e.stderr if e.stderr else e.stdout}\n```",
+                color=ERROR_COLOR
+            )
+            await msg.edit(embed=embed)
+            
+    except Exception as e:
+        print(f"Error in restart_server: {e}")
+        try:
+            await interaction.followup.send(
+                embed=create_embed("❌ Error", "An error occurred while processing your request.", color=ERROR_COLOR),
+                ephemeral=True
+            )
+        except:
+            pass
+
+@bot.tree.command(name="remove", description="❌ Permanently delete your cloud instance")
+@app_commands.describe(container_id="Your instance ID (first 4+ characters)")
+async def remove_server(interaction: discord.Interaction, container_id: str):
+    """Remove a VPS"""
+    try:
+        user = str(interaction.user)
+        container_info = None
+        ssh_command = None
+        
+        if not os.path.exists(database_file):
+            embed = create_embed(
+                "📭 No Instances Found",
+                "You don't have any active instances!",
+                color=INFO_COLOR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        with open(database_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split('|')
+                if len(parts) >= 3 and user == parts[0] and container_id in parts[1]:
+                    container_info = parts[1]
+                    ssh_command = parts[2]
+                    break
+
+        if not container_info:
+            embed = create_embed(
+                "🔍 Instance Not Found",
+                "No instance found with that ID that belongs to you!",
+                color=INFO_COLOR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # Confirmation view
+        class ConfirmView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=30)
+                self.value = None
+            
+            @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.danger)
+            async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+                self.value = True
+                self.stop()
+                
+                await interaction.response.defer()
+                
+                try:
+                    check_cmd = subprocess.run(
+                        ["docker", "inspect", container_info],
+                        capture_output=True, text=True
+                    )
+                    
+                    if check_cmd.returncode != 0:
+                        embed = create_embed(
+                            "❌ Container Not Found",
+                            f"Container `{container_info[:12]}` doesn't exist in Docker!",
+                            color=ERROR_COLOR
+                        )
+                        await interaction.followup.send(embed=embed, ephemeral=True)
+                        remove_from_database(ssh_command)
+                        return
+                    
+                    subprocess.run(["docker", "stop", container_info], check=True)
+                    subprocess.run(["docker", "rm", container_info], check=True)
+                    
+                    remove_from_database(ssh_command)
+                    
+                    embed = create_embed(
+                        f"🗑️ Instance Deleted {random.choice(SUCCESS_ANIMATION)}",
+                        f"Instance `{container_info[:12]}` has been permanently deleted!",
+                        color=SUCCESS_COLOR
+                    )
+                    await interaction.followup.send(embed=embed)
+                    await send_to_logs(f"❌ {interaction.user.mention} deleted instance `{container_info[:12]}`")
+                    
+                except subprocess.CalledProcessError as e:
+                    embed = create_embed(
+                        f"❌ Deletion Failed {random.choice(ERROR_ANIMATION)}",
+                        f"```diff\n- Error deleting container:\n{e.stderr if e.stderr else e.stdout}\n```",
+                        color=ERROR_COLOR
+                    )
+                    await interaction.followup.send(embed=embed)
+            
+            @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+            async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+                self.value = False
+                self.stop()
+                embed = create_embed(
+                    "Deletion Cancelled",
+                    f"Instance `{container_info[:12]}` was not deleted.",
+                    color=INFO_COLOR
+                )
+                await interaction.response.edit_message(embed=embed, view=None)
+        
+        embed = create_embed(
+            "⚠️ Confirm Deletion",
+            f"Are you sure you want to **permanently delete** instance `{container_info[:12]}`?",
+            color=WARNING_COLOR,
+            footer="This action cannot be undone!"
+        )
+        
+        view = ConfirmView()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        
+    except Exception as e:
+        print(f"Error in remove_server: {e}")
+        try:
+            await interaction.followup.send(
+                embed=create_embed("❌ Error", "An error occurred while processing your request.", color=ERROR_COLOR),
+                ephemeral=True
+            )
+        except:
+            pass
+
+@bot.tree.command(name="regen-ssh", description="🔄 Regenerate SSH connection for your instance")
+@app_commands.describe(container_id="Your instance ID (first 4+ characters)")
+async def regen_ssh(interaction: discord.Interaction, container_id: str):
+    """Regenerate SSH for a VPS"""
+    try:
+        user = str(interaction.user)
+        container_info = None
+        old_ssh_command = None
+        
+        if not os.path.exists(database_file):
+            embed = create_embed(
+                "📭 No Instances Found",
+                "You don't have any active instances!",
+                color=INFO_COLOR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        with open(database_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split('|')
+                if len(parts) >= 3 and user == parts[0] and container_id in parts[1]:
+                    container_info = parts[1]
+                    old_ssh_command = parts[2]
+                    break
+
+        if not container_info:
+            embed = create_embed(
+                "🔍 Instance Not Found",
+                "No instance found with that ID that belongs to you!",
+                color=INFO_COLOR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        try:
+            check_cmd = subprocess.run(
+                ["docker", "inspect", "--format='{{.State.Status}}'", container_info],
+                capture_output=True, text=True
+            )
+            
+            if check_cmd.returncode != 0:
+                embed = create_embed(
+                    "❌ Container Not Found",
+                    f"Container `{container_info[:12]}` doesn't exist in Docker!",
+                    color=ERROR_COLOR
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                remove_from_database(old_ssh_command)
+                return
+            
+            container_status = check_cmd.stdout.strip().strip("'")
+            if container_status != "running":
+                embed = create_embed(
+                    "⚠️ Instance Not Running",
+                    f"Container `{container_info[:12]}` is not running. Start it first with `/start`.",
+                    color=WARNING_COLOR
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+            
+            embed = create_embed(
+                "⚙️ Regenerating SSH Connection",
+                f"```diff\n+ Generating new SSH details for {container_info[:12]}...\n```",
+                color=EMBED_COLOR
+            )
+            await interaction.response.send_message(embed=embed)
+            msg = await interaction.original_response()
+
+            try:
+                subprocess.run(
+                    ["docker", "exec", container_info, "pkill", "tmate"],
+                    stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+                )
+                
+                exec_cmd = await asyncio.create_subprocess_exec(
+                    "docker", "exec", container_info, "tmate", "-F",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                ssh_session_line = await capture_ssh_session_line(exec_cmd)
+                
+                if ssh_session_line:
+                    remove_from_database(old_ssh_command)
+                    add_to_database(user, container_info, ssh_session_line)
+                    
+                    try:
+                        dm_embed = create_embed(
+                            f"🔄 SSH Regenerated {random.choice(SUCCESS_ANIMATION)}",
+                            f"**New SSH Connection Details:**\n```{ssh_session_line}```",
+                            color=SUCCESS_COLOR,
+                            fields=[("⚠️ Important", "The old SSH connection is no longer valid", False)]
+                        )
+                        await interaction.user.send(embed=dm_embed)
+                    except discord.Forbidden:
+                        pass
+                    
+                    embed = create_embed(
+                        f"✅ SSH Regenerated {random.choice(SUCCESS_ANIMATION)}",
+                        f"New SSH details generated for `{container_info[:12]}`!\n📩 Check your DMs for the new connection.",
+                        color=SUCCESS_COLOR
+                    )
+                else:
+                    embed = create_embed(
+                        "⚠️ SSH Regeneration Failed",
+                        f"Could not generate new SSH details for `{container_info[:12]}`.\nTry again later.",
+                        color=WARNING_COLOR
+                    )
+            except Exception as e:
+                print(f"Error regenerating SSH: {e}")
+                embed = create_embed(
+                    "❌ SSH Regeneration Failed",
+                    f"An error occurred while regenerating SSH for `{container_info[:12]}`.",
+                    color=ERROR_COLOR
+                )
+            
+            await msg.edit(embed=embed)
+            
+            if ssh_session_line:
+                await send_to_logs(f"🔄 {interaction.user.mention} regenerated SSH for instance `{container_info[:12]}`")
+            
+        except subprocess.CalledProcessError as e:
+            embed = create_embed(
+                "❌ Error Regenerating SSH",
+                f"```diff\n- Error:\n{e.stderr if e.stderr else e.stdout}\n```",
+                color=ERROR_COLOR
+            )
+            try:
+                await msg.edit(embed=embed)
+            except:
+                pass
+            
+    except Exception as e:
+        print(f"Error in regen_ssh: {e}")
+        try:
+            await interaction.followup.send(
+                embed=create_embed("❌ Error", "An error occurred while processing your request.", color=ERROR_COLOR),
+                ephemeral=True
+            )
+        except:
+            pass
+
+@bot.tree.command(name="list", description="📜 List your cloud instances")
+async def list_servers(interaction: discord.Interaction):
+    """List user's VPS"""
+    try:
+        user = str(interaction.user)
+        servers = get_user_servers(user)
+        
+        if not servers:
+            embed = create_embed(
+                "📭 No Instances Found",
+                "You don't have any active instances.",
+                color=INFO_COLOR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        embed = create_embed(
+            f"📋 Your Cloud Instances ({len(servers)}/{SERVER_LIMIT})",
+            color=EMBED_COLOR
+        )
+        
+        for server in servers:
+            parts = server.split('|')
+            if len(parts) < 3:
+                continue
+                
+            container_id = parts[1]
+            os_type = "Unknown"
+            
+            for os_id, os_data in OS_OPTIONS.items():
+                if os_id in parts[2].lower():
+                    os_type = f"{os_data['emoji']} {os_data['name']}"
+                    break
+                    
+            try:
+                status = subprocess.check_output(
+                    ["docker", "inspect", "--format='{{.State.Status}}'", container_id],
+                    stderr=subprocess.DEVNULL
+                ).decode('utf-8').strip().strip("'")
+                
+                status_emoji = "🟢" if status == "running" else "🔴"
+                status_text = f"{status_emoji} {status.capitalize()}"
+            except:
+                status_text = "🔴 Unknown"
+                    
             embed.add_field(
-                name=f"VPS: {vps['vps_id']}",
-                value=f"""
-Status: {status}
-Memory: {vps.get('memory', '?')}GB
-CPU: {vps.get('cpu', '?')} cores
-Disk: {vps.get('disk', '?')}GB
-Uptime: {uptime_str}
-Created: {vps.get('created_at', '?')[:10]}
-""",
+                name=f"🖥️ Instance `{container_id[:12]}`",
+                value=(
+                    f"▫️ **OS**: {os_type}\n"
+                    f"▫️ **Status**: {status_text}\n"
+                    f"▫️ **ID**: `{container_id[:12]}`"
+                ),
                 inline=False
             )
         
-        await ctx.send(embed=embed)
+        embed.set_footer(text="Use /start, /stop, or /remove with the instance ID")
+        await interaction.response.send_message(embed=embed)
     except Exception as e:
-        logger.error(f"Error in list_vps: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
+        print(f"Error in list_servers: {e}")
+        try:
+            await interaction.followup.send(
+                embed=create_embed("❌ Error", "An error occurred while processing your request.", color=ERROR_COLOR),
+                ephemeral=True
+            )
+        except:
+            pass
 
-@bot.hybrid_command(name='list_all', description='List all VPS (Admin only)')
-async def list_all_vps(ctx):
-    """List all VPS instances (Admin only)"""
+@bot.tree.command(name="list-all", description="📜 [ADMIN] List all deployed instances")
+async def list_all_servers(interaction: discord.Interaction):
+    """List all VPS (Admin only)"""
+    if not is_admin(interaction.user.id):
+        embed = create_embed(
+            "🚫 Permission Denied",
+            f"{EMOJI['warning']} This command is restricted to administrators only.",
+            color=ERROR_COLOR
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
     try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
+        await interaction.response.defer()
 
-        all_vps = bot.db.get_all_vps()
+        servers = get_all_servers()
+        container_stats = get_container_stats()
+        host_stats = get_system_resources()
         
-        if not all_vps:
-            await ctx.send("❌ No VPS found.", ephemeral=True)
-            return
+        embed = create_embed(
+            f"📊 System Overview - All Instances ({len(servers)} total)",
+            color=EMBED_COLOR
+        )
 
-        embed = discord.Embed(title="All VantaNode VPS", color=discord.Color.gold())
+        cpu_emoji = "🟢" if host_stats['cpu'] < 70 else "🟡" if host_stats['cpu'] < 90 else "🔴"
+        mem_emoji = "🟢" if host_stats['memory']['percent'] < 70 else "🟡" if host_stats['memory']['percent'] < 90 else "🔴"
+        disk_emoji = "🟢" if host_stats['disk']['percent'] < 70 else "🟡" if host_stats['disk']['percent'] < 90 else "🔴"
         
-        for token, vps in list(all_vps.items())[:25]:  # Limit to 25 to avoid embed limits
-            try:
-                owner = await bot.fetch_user(int(vps['created_by']))
-                owner_name = owner.name
-            except:
-                owner_name = f"User {vps['created_by']}"
-                
-            try:
-                if vps["container_id"]:
-                    container = bot.docker_client.containers.get(vps["container_id"])
-                    status = container.status.capitalize()
-                else:
-                    status = "Unknown"
-            except Exception:
-                status = vps.get('status', 'Unknown').capitalize()
+        embed.add_field(
+            name="🖥️ Host System Resources",
+            value=(
+                f"{cpu_emoji} **CPU Usage**: {host_stats['cpu']}%\n"
+                f"{mem_emoji} **Memory**: {host_stats['memory']['used']}GB / {host_stats['memory']['total']}GB ({host_stats['memory']['percent']}%)\n"
+                f"{disk_emoji} **Disk**: {host_stats['disk']['used']}GB / {host_stats['disk']['total']}GB ({host_stats['disk']['percent']}%)"
+            ),
+            inline=False
+        )
+        embed.add_field(name="\u200b", value="\u200b", inline=False)
 
+        if not servers:
             embed.add_field(
-                name=f"VPS: {vps['vps_id']}",
-                value=f"""
-Owner: {owner_name}
-Status: {status}
-Memory: {vps.get('memory', '?')}GB
-CPU: {vps.get('cpu', '?')} cores
-Disk: {vps.get('disk', '?')}GB
-""",
-                inline=True
+                name="📭 No Instances Found",
+                value="There are no active instances.",
+                inline=False
+            )
+            await interaction.followup.send(embed=embed)
+            return
+
+        for server in servers:
+            parts = server.split('|')
+            if len(parts) < 3:
+                continue
+                
+            user_owner = parts[0]
+            container_id = parts[1]
+            os_type = "Unknown"
+            
+            for os_id, os_data in OS_OPTIONS.items():
+                if os_id in parts[2].lower():
+                    os_type = f"{os_data['emoji']} {os_data['name']}"
+                    break
+
+            stats = container_stats.get(container_id, {'cpu': '0.00%', 'mem_used': '0B', 'mem_limit': '0B'})
+            
+            try:
+                status = subprocess.check_output(
+                    ["docker", "inspect", "--format='{{.State.Status}}'", container_id],
+                    stderr=subprocess.DEVNULL
+                ).decode('utf-8').strip().strip("'")
+                
+                status_emoji = "🟢" if status == "running" else "🔴"
+                status_text = f"{status_emoji} {status.capitalize()}"
+            except:
+                status_text = "🔴 Unknown"
+            
+            embed.add_field(
+                name=f"🖥️ Instance `{container_id[:12]}`",
+                value=(
+                    f"▫️ **Owner**: `{user_owner}`\n"
+                    f"▫️ **OS**: {os_type}\n"
+                    f"▫️ **Status**: {status_text}\n"
+                    f"▫️ **CPU**: {stats['cpu']}\n"
+                    f"▫️ **RAM**: {stats['mem_used']} / {stats['mem_limit']}"
+                ),
+                inline=False
             )
         
-        await ctx.send(embed=embed)
+        await interaction.followup.send(embed=embed)
     except Exception as e:
-        logger.error(f"Error in list_all_vps: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='vps_stats', description='Show detailed stats for a VPS')
-@app_commands.describe(vps_id="VPS ID")
-async def vps_stats(ctx, vps_id: str):
-    """Show detailed statistics for a VPS"""
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps:
-            await ctx.send("❌ VPS not found.", ephemeral=True)
-            return
-
-        # Check permissions
-        caller_id = str(ctx.author.id)
-        is_owner = caller_id == vps['created_by']
-        is_admin = has_admin_role(ctx)
-        
-        if not (is_owner or is_admin):
-            await ctx.send("❌ You don't have permission to view this VPS.", ephemeral=True)
-            return
-
-        # Get resource usage
-        resource_usage = bot.db.get_resource_usage(vps_id)
-        
-        # Get container status
-        container_status = "Unknown"
+        print(f"Error in list_all_servers: {e}")
         try:
-            if vps["container_id"]:
-                container = bot.docker_client.containers.get(vps["container_id"])
-                container_status = container.status.capitalize()
-        except Exception:
+            await interaction.followup.send(
+                embed=create_embed("❌ Error", "An error occurred while processing your request.", color=ERROR_COLOR),
+                ephemeral=True
+            )
+        except:
             pass
 
-        # Calculate uptime
-        uptime_seconds = vps.get('total_uptime', 0)
-        if vps_id in VPS_UPTIME_TRACKER:
-            current_uptime = (datetime.datetime.now() - VPS_UPTIME_TRACKER[vps_id]['start_time']).total_seconds()
-            uptime_seconds += int(current_uptime)
+@bot.tree.command(name="delete-container", description="❌ [ADMIN] Delete any container by ID")
+@app_commands.describe(container_id="The ID of the container to delete")
+async def delete_user_container(interaction: discord.Interaction, container_id: str):
+    """Delete any container (Admin only)"""
+    if not is_admin(interaction.user.id):
+        embed = create_embed(
+            "🚫 Permission Denied",
+            f"{EMOJI['warning']} This command is restricted to administrators only.",
+            color=ERROR_COLOR
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    try:
+        user_owner, container_info, ssh_command = get_container_info_by_id(container_id)
         
-        uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
-        
-        embed = discord.Embed(title=f"VPS Stats: {vps_id}", color=discord.Color.green())
-        embed.add_field(name="Status", value=container_status, inline=True)
-        embed.add_field(name="Uptime", value=uptime_str, inline=True)
-        embed.add_field(name="Restarts", value=vps.get('restart_count', 0), inline=True)
-        embed.add_field(name="\u200b", value="\u200b", inline=False)
-        
-        # Resource allocation
-        embed.add_field(name="Allocated Resources", value="", inline=False)
-        embed.add_field(name="Memory", value=f"{vps.get('memory', '?')}GB", inline=True)
-        embed.add_field(name="CPU", value=f"{vps.get('cpu', '?')} cores", inline=True)
-        embed.add_field(name="Disk", value=f"{vps.get('disk', '?')}GB", inline=True)
-        
-        if resource_usage:
-            embed.add_field(name="\u200b", value="\u200b", inline=False)
-            embed.add_field(name="Current Usage", value="", inline=False)
-            embed.add_field(name="CPU Usage", value=f"{resource_usage.get('cpu_usage', 0):.1f}%", inline=True)
-            embed.add_field(name="Memory Usage", value=f"{resource_usage.get('memory_usage', 0):.1f}%", inline=True)
-            embed.add_field(name="Network TX", value=f"{resource_usage.get('network_tx', 0):.1f}MB", inline=True)
-            embed.add_field(name="Network RX", value=f"{resource_usage.get('network_rx', 0):.1f}MB", inline=True)
+        if not container_info:
+            embed = create_embed(
+                "❌ Container Not Found",
+                f"Could not find a container with the ID `{container_id[:12]}`.",
+                color=ERROR_COLOR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
             
-            if resource_usage.get('last_updated'):
-                last_updated = datetime.datetime.fromisoformat(resource_usage['last_updated'])
-                embed.set_footer(text=f"Last updated: {last_updated.strftime('%Y-%m-%d %H:%M:%S')}")
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error in vps_stats: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='vps_uptime', description='Show VPS uptime')
-@app_commands.describe(vps_id="VPS ID")
-async def vps_uptime(ctx, vps_id: str):
-    """Show detailed uptime information for a VPS"""
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps:
-            await ctx.send("❌ VPS not found.", ephemeral=True)
-            return
-
-        # Check permissions
-        caller_id = str(ctx.author.id)
-        is_owner = caller_id == vps['created_by']
-        is_admin = has_admin_role(ctx)
-        
-        if not (is_owner or is_admin):
-            await ctx.send("❌ You don't have permission to view this VPS.", ephemeral=True)
-            return
-
-        # Calculate total uptime
-        total_uptime = vps.get('total_uptime', 0)
-        current_uptime = 0
-        
-        if vps_id in VPS_UPTIME_TRACKER:
-            current_uptime = (datetime.datetime.now() - VPS_UPTIME_TRACKER[vps_id]['start_time']).total_seconds()
-        
-        total_seconds = total_uptime + current_uptime
-        
-        # Format uptime
-        days = int(total_seconds // (24 * 3600))
-        hours = int((total_seconds % (24 * 3600)) // 3600)
-        minutes = int((total_seconds % 3600) // 60)
-        seconds = int(total_seconds % 60)
-        
-        uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
-        
-        # Calculate uptime percentage if we have creation date
-        created_at = datetime.datetime.fromisoformat(vps['created_at']) if 'created_at' in vps else None
-        if created_at:
-            total_lifetime = (datetime.datetime.now() - created_at).total_seconds()
-            uptime_percentage = (total_seconds / total_lifetime) * 100 if total_lifetime > 0 else 100
-        else:
-            uptime_percentage = 100
-        
-        embed = discord.Embed(title=f"VPS Uptime: {vps_id}", color=discord.Color.blue())
-        embed.add_field(name="Total Uptime", value=uptime_str, inline=False)
-        embed.add_field(name="Uptime Percentage", value=f"{uptime_percentage:.2f}%", inline=True)
-        embed.add_field(name="Restarts", value=vps.get('restart_count', 0), inline=True)
-        
-        if created_at:
-            embed.add_field(name="Created", value=created_at.strftime("%Y-%m-%d %H:%M:%S"), inline=False)
-        
-        if vps.get('last_restart'):
-            last_restart = datetime.datetime.fromisoformat(vps['last_restart'])
-            embed.add_field(name="Last Restart", value=last_restart.strftime("%Y-%m-%d %H:%M:%S"), inline=False)
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error in vps_uptime: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='resource_stats', description='Show resource allocation stats (Admin only)')
-async def resource_stats(ctx):
-    """Show system resource allocation statistics"""
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-
-        # Get system info
-        mem = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
-        
-        # Get allocated resources
-        allocated_memory = bot.db.get_setting('total_allocated_memory', 0)
-        allocated_cpu = bot.db.get_setting('total_allocated_cpu', 0)
-        allocated_disk = bot.db.get_setting('total_allocated_disk', 0)
-        
-        # Calculate percentages
-        memory_percent = (allocated_memory / (mem.total / (1024 ** 3))) * 100 if mem.total > 0 else 0
-        cpu_percent = (allocated_cpu / CPU_CORES_AVAILABLE) * 100 if CPU_CORES_AVAILABLE > 0 else 0
-        disk_percent = (allocated_disk / (disk.total / (1024 ** 3))) * 100 if disk.total > 0 else 0
-        
-        embed = discord.Embed(title="System Resource Allocation", color=discord.Color.purple())
-        
-        # Memory stats
-        embed.add_field(name="Memory", value=f"""
-Total: {mem.total / (1024 ** 3):.1f} GB
-Allocated: {allocated_memory} GB
-Available: {(mem.total / (1024 ** 3)) - allocated_memory:.1f} GB
-Usage: {memory_percent:.1f}%
-""", inline=True)
-        
-        # CPU stats
-        embed.add_field(name="CPU", value=f"""
-Total Cores: {CPU_CORES_AVAILABLE}
-Allocated Cores: {allocated_cpu}
-Available Cores: {CPU_CORES_AVAILABLE - allocated_cpu}
-Usage: {cpu_percent:.1f}%
-""", inline=True)
-        
-        # Disk stats
-        embed.add_field(name="Disk", value=f"""
-Total: {disk.total / (1024 ** 3):.1f} GB
-Allocated: {allocated_disk} GB
-Available: {(disk.total / (1024 ** 3)) - allocated_disk:.1f} GB
-Usage: {disk_percent:.1f}%
-""", inline=True)
-        
-        # VPS count
-        total_vps = len(bot.db.get_all_vps())
-        running_vps = sum(1 for vps in bot.db.get_all_vps().values() if vps.get('status') == 'running')
-        
-        embed.add_field(name="VPS Statistics", value=f"""
-Total VPS: {total_vps}
-Running VPS: {running_vps}
-Stopped VPS: {total_vps - running_vps}
-Max Containers: {bot.db.get_setting('max_containers', MAX_CONTAINERS)}
-""", inline=False)
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error in resource_stats: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='delete_vps', description='Delete a VPS (Admin only)')
-@app_commands.describe(vps_id="VPS ID", reason="Reason for deletion (optional)")
-async def delete_vps(ctx, vps_id: str, reason: Optional[str] = None):
-    """Delete a VPS instance"""
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps:
-            await ctx.send("❌ VPS not found.", ephemeral=True)
-            return
-
-        # Free CPU cores
-        if vps.get('allocated_cpus'):
-            free_cpu_cores(vps['allocated_cpus'])
-        
-        # Remove from uptime tracker
-        if vps_id in VPS_UPTIME_TRACKER:
-            # Update uptime before removing
-            current_time = datetime.datetime.now()
-            uptime_seconds = (current_time - VPS_UPTIME_TRACKER[vps_id]['start_time']).total_seconds()
-            bot.db.update_uptime(vps_id, int(uptime_seconds))
-            del VPS_UPTIME_TRACKER[vps_id]
-        
-        # Stop and remove container
-        try:
-            if vps["container_id"] and bot.docker_client:
-                container = bot.docker_client.containers.get(vps["container_id"])
-                container.stop()
-                container.remove(v=True)
+        # Confirmation view
+        class AdminConfirmView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=30)
+                self.value = None
+            
+            @discord.ui.button(label="☠️ Force Delete", style=discord.ButtonStyle.danger)
+            async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+                self.value = True
+                self.stop()
                 
-                # Remove volume
-                volume_name = f"vantanode-{vps_id}-disk"
+                await interaction.response.defer()
+                
                 try:
-                    volume = bot.docker_client.volumes.get(volume_name)
-                    volume.remove()
-                except:
-                    pass
-        except Exception as e:
-            logger.warning(f"Error removing container: {e}")
-        
-        # Remove from database
-        bot.db.remove_vps(token)
-        
-        # Notify owner
-        try:
-            owner = await bot.fetch_user(int(vps['created_by']))
-            embed = discord.Embed(title="VPS Deleted", color=discord.Color.red())
-            embed.add_field(name="VPS ID", value=vps_id, inline=True)
-            embed.add_field(name="Deleted By", value=ctx.author.name, inline=True)
-            if reason:
-                embed.add_field(name="Reason", value=reason, inline=False)
-            embed.add_field(name="Resources Freed", value=f"""
-Memory: {vps.get('memory', 0)}GB
-CPU: {vps.get('cpu', 0)} cores
-Disk: {vps.get('disk', 0)}GB
-""", inline=False)
-            await owner.send(embed=embed)
-        except:
-            pass
-        
-        await ctx.send(f"✅ VPS {vps_id} deleted successfully.")
-        
-    except Exception as e:
-        logger.error(f"Error in delete_vps: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='admin_stats', description='Show admin statistics (Admin only)')
-async def admin_stats(ctx):
-    """Show admin statistics"""
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-
-        # Get system stats
-        cpu_percent = psutil.cpu_percent()
-        mem = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
-        
-        # Get Docker stats
-        container_count = len(bot.docker_client.containers.list(all=True)) if bot.docker_client else 0
-        running_containers = len(bot.docker_client.containers.list()) if bot.docker_client else 0
-        
-        # Get database stats
-        total_vps = bot.db.get_stat('total_vps_created', 0)
-        banned_users = len(bot.db.get_banned_users())
-        admins = len(bot.db.get_admins())
-        
-        embed = discord.Embed(title="Admin Statistics", color=discord.Color.gold())
-        
-        embed.add_field(name="System Health", value=f"""
-CPU Usage: {cpu_percent:.1f}%
-Memory Usage: {mem.percent:.1f}%
-Disk Usage: {disk.percent:.1f}%
-""", inline=False)
-        
-        embed.add_field(name="Docker Status", value=f"""
-Total Containers: {container_count}
-Running Containers: {running_containers}
-Max Allowed: {bot.db.get_setting('max_containers', MAX_CONTAINERS)}
-""", inline=False)
-        
-        embed.add_field(name="VPS Statistics", value=f"""
-Total VPS Created: {total_vps}
-Current VPS Count: {len(bot.db.get_all_vps())}
-Banned Users: {banned_users}
-Admins: {admins}
-""", inline=False)
-        
-        embed.add_field(name="Resource Allocation", value=f"""
-Total Allocated Memory: {bot.db.get_setting('total_allocated_memory', 0)} GB
-Total Allocated CPU: {bot.db.get_setting('total_allocated_cpu', 0)} cores
-Total Allocated Disk: {bot.db.get_setting('total_allocated_disk', 0)} GB
-""", inline=False)
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error in admin_stats: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='system_info', description='Show system information (Admin only)')
-async def system_info(ctx):
-    """Show detailed system information"""
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-
-        # Get system information
-        uname = platform.uname()
-        boot_time = datetime.datetime.fromtimestamp(psutil.boot_time())
-        
-        # Network info
-        hostname = socket.gethostname()
-        ip_address = socket.gethostbyname(hostname)
-        
-        # Docker info
-        docker_version = "Unknown"
-        docker_info = "Unknown"
-        if bot.docker_client:
-            try:
-                docker_version = bot.docker_client.version()['Version']
-                docker_info = bot.docker_client.info()
-            except:
-                pass
-        
-        embed = discord.Embed(title="System Information", color=discord.Color.dark_grey())
-        
-        embed.add_field(name="System", value=f"""
-System: {uname.system}
-Node Name: {uname.node}
-Release: {uname.release}
-Version: {uname.version}
-Machine: {uname.machine}
-Processor: {uname.processor}
-""", inline=False)
-        
-        embed.add_field(name="Boot Time", value=boot_time.strftime("%Y-%m-%d %H:%M:%S"), inline=True)
-        embed.add_field(name="Hostname", value=hostname, inline=True)
-        embed.add_field(name="IP Address", value=ip_address, inline=True)
-        
-        if docker_version != "Unknown":
-            embed.add_field(name="Docker", value=f"""
-Version: {docker_version}
-Containers: {docker_info.get('Containers', 'N/A')}
-Running: {docker_info.get('ContainersRunning', 'N/A')}
-Paused: {docker_info.get('ContainersPaused', 'N/A')}
-Stopped: {docker_info.get('ContainersStopped', 'N/A')}
-""", inline=False)
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error in system_info: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='container_limit', description='Set maximum container limit (Admin only)')
-@app_commands.describe(max_containers="Maximum number of containers allowed")
-async def container_limit(ctx, max_containers: int):
-    """Set maximum container limit"""
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-
-        if max_containers < 1 or max_containers > 500:
-            await ctx.send("❌ Limit must be between 1 and 500.", ephemeral=True)
-            return
-
-        bot.db.set_setting('max_containers', max_containers)
-        await ctx.send(f"✅ Maximum container limit set to {max_containers}.")
-        
-    except Exception as e:
-        logger.error(f"Error in container_limit: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='global_stats', description='Show global statistics')
-async def global_stats(ctx):
-    """Show global statistics"""
-    try:
-        # Get VPS statistics by user
-        all_vps = bot.db.get_all_vps()
-        user_vps_count = defaultdict(int)
-        
-        for vps in all_vps.values():
-            user_vps_count[vps['created_by']] += 1
-        
-        top_users = sorted(user_vps_count.items(), key=lambda x: x[1], reverse=True)[:5]
-        
-        # Calculate total resources
-        total_memory = sum(vps.get('memory', 0) for vps in all_vps.values())
-        total_cpu = sum(vps.get('cpu', 0) for vps in all_vps.values())
-        total_disk = sum(vps.get('disk', 0) for vps in all_vps.values())
-        
-        # Calculate total uptime
-        total_uptime = sum(vps.get('total_uptime', 0) for vps in all_vps.values())
-        for vps_id, tracker in VPS_UPTIME_TRACKER.items():
-            if vps_id in all_vps:
-                current_uptime = (datetime.datetime.now() - tracker['start_time']).total_seconds()
-                total_uptime += int(current_uptime)
-        
-        uptime_str = str(datetime.timedelta(seconds=total_uptime))
-        
-        embed = discord.Embed(title="Global VantaNode Statistics", color=discord.Color.blue())
-        
-        embed.add_field(name="Total Statistics", value=f"""
-Total VPS: {len(all_vps)}
-Total Memory Allocated: {total_memory} GB
-Total CPU Cores Allocated: {total_cpu}
-Total Disk Allocated: {total_disk} GB
-Total Uptime: {uptime_str}
-""", inline=False)
-        
-        if top_users:
-            top_users_str = "\n".join([f"<@{user_id}>: {count} VPS" for user_id, count in top_users])
-            embed.add_field(name="Top VPS Owners", value=top_users_str, inline=False)
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error in global_stats: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='edit_vps', description='Edit VPS resources (Admin only)')
-@app_commands.describe(
-    vps_id="VPS ID",
-    memory="New memory in GB (optional)",
-    cpu="New CPU cores (optional)",
-    disk="New disk in GB (optional)"
-)
-async def edit_vps(ctx, vps_id: str, memory: Optional[int] = None, cpu: Optional[int] = None, disk: Optional[int] = None):
-    """Edit VPS resources"""
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps:
-            await ctx.send("❌ VPS not found.", ephemeral=True)
-            return
-
-        updates = {}
-        
-        if memory is not None:
-            if not (1 <= memory <= 512):
-                await ctx.send("❌ Memory must be between 1-512GB", ephemeral=True)
-                return
-            updates['memory'] = memory
-            
-        if cpu is not None:
-            if not (1 <= cpu <= 32):
-                await ctx.send("❌ CPU must be between 1-32 cores", ephemeral=True)
-                return
-            
-            # Free old CPU cores and allocate new ones
-            if vps.get('allocated_cpus'):
-                free_cpu_cores(vps['allocated_cpus'])
-            
-            try:
-                new_cpuset = allocate_cpu_cores(cpu)
-                updates['cpu'] = cpu
-                updates['allocated_cpus'] = new_cpuset
-            except Exception as e:
-                await ctx.send(f"❌ {str(e)}", ephemeral=True)
-                return
-            
-        if disk is not None:
-            if not (10 <= disk <= 1000):
-                await ctx.send("❌ Disk must be between 10-1000GB", ephemeral=True)
-                return
-            updates['disk'] = disk
-        
-        if not updates:
-            await ctx.send("❌ No changes specified.", ephemeral=True)
-            return
-        
-        # Update container if it exists
-        if vps["container_id"] and bot.docker_client:
-            try:
-                container = bot.docker_client.containers.get(vps["container_id"])
-                
-                if memory is not None:
-                    # Update memory limits
-                    container.update(mem_limit=f"{memory}g", memswap_limit=f"{memory}g")
-                
-                if cpu is not None:
-                    # Update CPU limits
-                    container.update(
-                        cpuset_cpus=updates.get('allocated_cpus', vps.get('allocated_cpus')),
-                        cpu_period=100000,
-                        cpu_quota=int(cpu * 100000),
-                        cpu_shares=1024 * cpu
+                    subprocess.run(["docker", "stop", container_info], check=True)
+                    subprocess.run(["docker", "rm", container_info], check=True)
+                    remove_container_from_database_by_id(container_info)
+                    
+                    embed = create_embed(
+                        f"☠️ Container Force Deleted {random.choice(SUCCESS_ANIMATION)}",
+                        f"Successfully deleted container `{container_info[:12]}`\n**Owner**: {user_owner}",
+                        color=SUCCESS_COLOR
                     )
-                
-                if disk is not None:
-                    # Note: Docker doesn't support dynamic disk resizing easily
-                    # This would require creating a new volume
-                    pass
-                    
-            except Exception as e:
-                logger.warning(f"Error updating container: {e}")
+                    await interaction.followup.send(embed=embed)
+                    await send_to_logs(f"💥 {interaction.user.mention} force-deleted container `{container_info[:12]}` owned by `{user_owner}`")
+
+                except subprocess.CalledProcessError as e:
+                    embed = create_embed(
+                        f"❌ Deletion Failed {random.choice(ERROR_ANIMATION)}",
+                        f"```diff\n- Error:\n{e.stderr if e.stderr else e.stdout}\n```",
+                        color=ERROR_COLOR
+                    )
+                    await interaction.followup.send(embed=embed)
+            
+            @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+            async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+                self.value = False
+                self.stop()
+                embed = create_embed(
+                    "Deletion Cancelled",
+                    f"Container `{container_info[:12]}` was not deleted.",
+                    color=INFO_COLOR
+                )
+                await interaction.response.edit_message(embed=embed, view=None)
         
-        # Update database
-        bot.db.update_vps(token, updates)
+        embed = create_embed(
+            "⚠️ Confirm Force Deletion",
+            f"You are about to **force delete** container `{container_info[:12]}`\n"
+            f"**Owner**: {user_owner}\n\n"
+            "This action is irreversible!",
+            color=WARNING_COLOR
+        )
         
-        # Update total allocated resources
-        if memory is not None:
-            total_mem = bot.db.get_setting('total_allocated_memory', 0) - vps.get('memory', 0) + memory
-            bot.db.set_setting('total_allocated_memory', total_mem)
-        
-        if cpu is not None:
-            total_cpu = bot.db.get_setting('total_allocated_cpu', 0) - vps.get('cpu', 0) + cpu
-            bot.db.set_setting('total_allocated_cpu', total_cpu)
-        
-        if disk is not None:
-            total_disk = bot.db.get_setting('total_allocated_disk', 0) - vps.get('disk', 0) + disk
-            bot.db.set_setting('total_allocated_disk', total_disk)
-        
-        await ctx.send(f"✅ VPS {vps_id} updated successfully.")
+        view = AdminConfirmView()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         
     except Exception as e:
-        logger.error(f"Error in edit_vps: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='manage_vps', description='Manage your VPS (start/stop/restart/status)')
-@app_commands.describe(vps_id="VPS ID", action="Action (start/stop/restart/status)")
-async def manage_vps(ctx, vps_id: str, action: str):
-    """Manage VPS (start/stop/restart/status)"""
-    try:
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps:
-            await ctx.send("❌ VPS not found.", ephemeral=True)
-            return
-
-        # Check permissions
-        caller_id = str(ctx.author.id)
-        is_owner = caller_id == vps['created_by']
-        is_admin = has_admin_role(ctx)
-        
-        if not (is_owner or is_admin):
-            await ctx.send("❌ You don't have permission to manage this VPS.", ephemeral=True)
-            return
-
-        if not bot.docker_client:
-            await ctx.send("❌ Docker not available.", ephemeral=True)
-            return
-
+        print(f"Error in delete_user_container: {e}")
         try:
-            container = bot.docker_client.containers.get(vps["container_id"])
-        except docker.errors.NotFound:
-            await ctx.send("❌ Container not found.", ephemeral=True)
-            return
-
-        action = action.lower()
-        
-        if action == 'status':
-            status = container.status.capitalize()
-            embed = discord.Embed(title=f"VPS Status: {vps_id}", color=discord.Color.blue())
-            embed.add_field(name="Status", value=status, inline=True)
-            embed.add_field(name="Created", value=container.attrs['Created'][:19], inline=True)
-            await ctx.send(embed=embed)
-            
-        elif action == 'start':
-            if container.status == 'running':
-                await ctx.send("❌ VPS is already running.", ephemeral=True)
-                return
-                
-            container.start()
-            
-            # Update uptime tracker
-            VPS_UPTIME_TRACKER[vps_id] = {
-                'start_time': datetime.datetime.now(),
-                'container_id': container.id
-            }
-            
-            bot.db.update_vps(token, {'status': 'running'})
-            await ctx.send(f"✅ VPS {vps_id} started successfully.")
-            
-        elif action == 'stop':
-            if container.status != 'running':
-                await ctx.send("❌ VPS is not running.", ephemeral=True)
-                return
-                
-            container.stop()
-            
-            # Update uptime before stopping
-            if vps_id in VPS_UPTIME_TRACKER:
-                current_time = datetime.datetime.now()
-                uptime_seconds = (current_time - VPS_UPTIME_TRACKER[vps_id]['start_time']).total_seconds()
-                bot.db.update_uptime(vps_id, int(uptime_seconds))
-                del VPS_UPTIME_TRACKER[vps_id]
-            
-            bot.db.update_vps(token, {'status': 'stopped'})
-            await ctx.send(f"✅ VPS {vps_id} stopped successfully.")
-            
-        elif action == 'restart':
-            container.restart()
-            
-            # Update restart count
-            restart_count = vps.get('restart_count', 0) + 1
-            bot.db.update_vps(token, {
-                'restart_count': restart_count,
-                'last_restart': datetime.datetime.now().isoformat()
-            })
-            
-            # Reset uptime tracker
-            VPS_UPTIME_TRACKER[vps_id] = {
-                'start_time': datetime.datetime.now(),
-                'container_id': container.id
-            }
-            
-            await ctx.send(f"✅ VPS {vps_id} restarted successfully.")
-            
-        else:
-            await ctx.send("❌ Invalid action. Use: start, stop, restart, status", ephemeral=True)
-            
-    except Exception as e:
-        logger.error(f"Error in manage_vps: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='transfer_vps', description='Transfer VPS ownership (Admin only)')
-@app_commands.describe(vps_id="VPS ID", new_owner="New owner user")
-async def transfer_vps(ctx, vps_id: str, new_owner: discord.Member):
-    """Transfer VPS ownership"""
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-
-        if bot.db.is_user_banned(new_owner.id):
-            await ctx.send("❌ New owner is banned!", ephemeral=True)
-            return
-
-        token, vps = bot.db.get_vps_by_id(vps_id)
-        if not vps:
-            await ctx.send("❌ VPS not found.", ephemeral=True)
-            return
-
-        # Check if new owner has reached limit
-        if bot.db.get_user_vps_count(new_owner.id) >= bot.db.get_setting('max_vps_per_user', MAX_VPS_PER_USER):
-            await ctx.send(f"❌ {new_owner.mention} has reached the maximum VPS limit.", ephemeral=True)
-            return
-
-        old_owner_id = vps['created_by']
-        
-        # Update database
-        bot.db.update_vps(token, {
-            'created_by': str(new_owner.id),
-            'username': new_owner.name.lower().replace(" ", "_")[:20]
-        })
-        
-        # Notify both users
-        try:
-            old_owner = await bot.fetch_user(int(old_owner_id))
-            embed = discord.Embed(title="VPS Transferred", color=discord.Color.orange())
-            embed.add_field(name="VPS ID", value=vps_id, inline=True)
-            embed.add_field(name="Transferred To", value=new_owner.name, inline=True)
-            embed.add_field(name="Transferred By", value=ctx.author.name, inline=True)
-            await old_owner.send(embed=embed)
+            await interaction.followup.send(
+                embed=create_embed("❌ Error", "An error occurred while processing your request.", color=ERROR_COLOR),
+                ephemeral=True
+            )
         except:
             pass
+
+@bot.tree.command(name="resources", description="📊 Show host system resources")
+async def resources_command(interaction: discord.Interaction):
+    """Show system resources"""
+    try:
+        resources = get_system_resources()
         
-        try:
-            embed = discord.Embed(title="VPS Received", color=discord.Color.green())
-            embed.add_field(name="VPS ID", value=vps_id, inline=True)
-            embed.add_field(name="Memory", value=f"{vps.get('memory', '?')}GB", inline=True)
-            embed.add_field(name="CPU", value=f"{vps.get('cpu', '?')} cores", inline=True)
-            embed.add_field(name="Disk", value=f"{vps.get('disk', '?')}GB", inline=True)
-            embed.add_field(name="Transferred From", value=f"User {old_owner_id}", inline=True)
-            await new_owner.send(embed=embed)
-        except:
-            pass
+        cpu_emoji = "🟢" if resources['cpu'] < 70 else "🟡" if resources['cpu'] < 90 else "🔴"
+        mem_emoji = "🟢" if resources['memory']['percent'] < 70 else "🟡" if resources['memory']['percent'] < 90 else "🔴"
+        disk_emoji = "🟢" if resources['disk']['percent'] < 70 else "🟡" if resources['disk']['percent'] < 90 else "🔴"
         
-        await ctx.send(f"✅ VPS {vps_id} transferred from <@{old_owner_id}> to {new_owner.mention}.")
+        embed = create_embed(
+            "📊 Host System Resources",
+            color=EMBED_COLOR,
+            fields=[
+                (f"{cpu_emoji} CPU Usage", f"```{resources['cpu']}%```", True),
+                (f"{mem_emoji} Memory", f"```{resources['memory']['used']}GB / {resources['memory']['total']}GB\n({resources['memory']['percent']}%)```", True),
+                (f"{disk_emoji} Disk Space", f"```{resources['disk']['used']}GB / {resources['disk']['total']}GB\n({resources['disk']['percent']}%)```", True)
+            ]
+        )
         
-    except Exception as e:
-        logger.error(f"Error in transfer_vps: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-# Additional basic commands
-@bot.hybrid_command(name='ban_user', description='Ban a user from using the bot (Admin only)')
-@app_commands.describe(user="User to ban", reason="Reason for ban (optional)")
-async def ban_user(ctx, user: discord.Member, reason: Optional[str] = None):
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-            
-        bot.db.ban_user(user.id)
-        embed = discord.Embed(title="User Banned", color=discord.Color.red())
-        embed.add_field(name="User", value=user.mention, inline=True)
-        embed.add_field(name="Banned By", value=ctx.author.mention, inline=True)
-        if reason:
-            embed.add_field(name="Reason", value=reason, inline=False)
-        await ctx.send(embed=embed)
-    except Exception as e:
-        logger.error(f"Error in ban_user: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='unban_user', description='Unban a user (Admin only)')
-@app_commands.describe(user="User to unban")
-async def unban_user(ctx, user: discord.Member):
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-            
-        bot.db.unban_user(user.id)
-        await ctx.send(f"✅ {user.mention} has been unbanned.")
-    except Exception as e:
-        logger.error(f"Error in unban_user: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='list_banned', description='List all banned users (Admin only)')
-async def list_banned(ctx):
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-            
-        banned_users = bot.db.get_banned_users()
-        if not banned_users:
-            await ctx.send("✅ No users are banned.")
-            return
-            
-        embed = discord.Embed(title="Banned Users", color=discord.Color.red())
-        for user_id in banned_users:
-            try:
-                user = await bot.fetch_user(int(user_id))
-                embed.add_field(name="User", value=f"{user.name} ({user.id})", inline=False)
-            except:
-                embed.add_field(name="User", value=f"Unknown ({user_id})", inline=False)
-        
-        await ctx.send(embed=embed)
-    except Exception as e:
-        logger.error(f"Error in list_banned: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='add_admin', description='Add an admin (Admin only)')
-@app_commands.describe(user="User to make admin")
-async def add_admin(ctx, user: discord.Member):
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-            
-        bot.db.add_admin(user.id)
-        await ctx.send(f"✅ {user.mention} has been added as an admin.")
-    except Exception as e:
-        logger.error(f"Error in add_admin: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='remove_admin', description='Remove an admin (Admin only)')
-@app_commands.describe(user="User to remove admin")
-async def remove_admin(ctx, user: discord.Member):
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-            
-        # Don't allow removing yourself if you're the only admin
-        admins = bot.db.get_admins()
-        if len(admins) <= 1 and str(user.id) in admins:
-            await ctx.send("❌ Cannot remove the only admin.")
-            return
-            
-        bot.db.remove_admin(user.id)
-        await ctx.send(f"✅ {user.mention} has been removed as an admin.")
-    except Exception as e:
-        logger.error(f"Error in remove_admin: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='list_admins', description='List all admins')
-async def list_admins(ctx):
-    try:
-        admins = bot.db.get_admins()
-        if not admins:
-            await ctx.send("✅ No admins found.")
-            return
-            
-        embed = discord.Embed(title="Admins", color=discord.Color.green())
-        for user_id in admins:
-            try:
-                user = await bot.fetch_user(int(user_id))
-                embed.add_field(name="Admin", value=f"{user.name} ({user.id})", inline=False)
-            except:
-                embed.add_field(name="Admin", value=f"Unknown ({user_id})", inline=False)
-        
-        await ctx.send(embed=embed)
-    except Exception as e:
-        logger.error(f"Error in list_admins: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='backup_data', description='Backup all bot data (Admin only)')
-async def backup_data(ctx):
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
-            
-        if bot.db.backup_data():
-            await ctx.send("✅ Data backup completed successfully.")
+        health_score = (100 - resources['cpu']) * 0.3 + (100 - resources['memory']['percent']) * 0.4 + (100 - resources['disk']['percent']) * 0.3
+        if health_score > 80:
+            health_msg = "🌟 Excellent system health!"
+        elif health_score > 60:
+            health_msg = "👍 Good system performance"
+        elif health_score > 40:
+            health_msg = "⚠️ System under moderate load"
         else:
-            await ctx.send("❌ Failed to backup data.")
-    except Exception as e:
-        logger.error(f"Error in backup_data: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='restore_data', description='Restore data from backup (Admin only)')
-async def restore_data(ctx):
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
+            health_msg = "🚨 Critical system load!"
             
-        # Warning message
-        await ctx.send("⚠️ **WARNING:** This will overwrite all current data. Type `CONFIRM` to proceed.")
+        embed.add_field(name="System Health", value=health_msg, inline=False)
         
-        def check(m):
-            return m.author == ctx.author and m.channel == ctx.channel and m.content == "CONFIRM"
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        print(f"Error in resources_command: {e}")
+        await interaction.response.send_message(
+            embed=create_embed("❌ Error", "An error occurred while processing your request.", color=ERROR_COLOR),
+            ephemeral=True
+        )
+
+@bot.tree.command(name="ping", description="🏓 Check bot latency")
+async def ping_command(interaction: discord.Interaction):
+    """Check bot latency"""
+    try:
+        latency = round(bot.latency * 1000)
         
-        try:
-            await bot.wait_for('message', timeout=30.0, check=check)
-        except asyncio.TimeoutError:
-            await ctx.send("❌ Restoration cancelled (timeout).")
-            return
-        
-        if bot.db.restore_data():
-            await ctx.send("✅ Data restoration completed successfully.")
+        if latency < 100:
+            emoji = "⚡"
+            status = "Excellent"
+        elif latency < 300:
+            emoji = "🏓"
+            status = "Good"
+        elif latency < 500:
+            emoji = "🐢"
+            status = "Slow"
         else:
-            await ctx.send("❌ Failed to restore data.")
-    except Exception as e:
-        logger.error(f"Error in restore_data: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
-
-@bot.hybrid_command(name='cleanup_vps', description='Cleanup unused VPS (Admin only)')
-async def cleanup_vps(ctx):
-    try:
-        if not has_admin_role(ctx):
-            await ctx.send("❌ Admin only!", ephemeral=True)
-            return
+            emoji = "🐌"
+            status = "Laggy"
             
-        await ctx.send("🔄 Cleaning up unused VPS...")
-        
-        all_vps = bot.db.get_all_vps()
-        cleaned = 0
-        
-        for token, vps in all_vps.items():
-            try:
-                if not vps["container_id"]:
-                    continue
-                    
-                container = bot.docker_client.containers.get(vps["container_id"])
-                if container.status != "running":
-                    # Container exists but isn't running
-                    container.remove(v=True)
-                    bot.db.remove_vps(token)
-                    cleaned += 1
-                    
-            except docker.errors.NotFound:
-                # Container doesn't exist
-                bot.db.remove_vps(token)
-                cleaned += 1
-            except Exception as e:
-                logger.error(f"Error cleaning up VPS {vps['vps_id']}: {e}")
-        
-        await ctx.send(f"✅ Cleanup completed. Removed {cleaned} unused VPS.")
-        
+        embed = create_embed(
+            f"{emoji} Pong!",
+            f"**Bot Latency**: {latency}ms\n**Status**: {status}",
+            color=EMBED_COLOR
+        )
+        await interaction.response.send_message(embed=embed)
     except Exception as e:
-        logger.error(f"Error in cleanup_vps: {e}")
-        await ctx.send(f"❌ Error: {str(e)}")
+        print(f"Error in ping_command: {e}")
+        await interaction.response.send_message(
+            embed=create_embed("❌ Error", "An error occurred while processing your request.", color=ERROR_COLOR),
+            ephemeral=True
+        )
 
+@bot.tree.command(name="uptime", description="⏱️ Show bot uptime")
+async def uptime_command(interaction: discord.Interaction):
+    """Show bot uptime"""
+    uptime = datetime.now() - bot.start_time
+    days = uptime.days
+    hours, remainder = divmod(uptime.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
+    
+    embed = create_embed(
+        "⏱️ Bot Uptime",
+        f"**Online for:** `{uptime_str}`\n**Started:** <t:{int(bot.start_time.timestamp())}:R>",
+        color=EMBED_COLOR
+    )
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="about", description="ℹ️ About the bot")
+async def about_command(interaction: discord.Interaction):
+    """About the bot"""
+    total_servers = len(get_all_servers())
+    total_users = len(set([s.split('|')[0] for s in get_all_servers()]))
+    
+    embed = create_embed(
+        f"About {bot.bot_name}",
+        f"{EMOJI['vps']} **Modern VPS Management Bot**",
+        color=EMBED_COLOR,
+        fields=[
+            ("👑 **Main Admin**", f"<@{bot.main_admin_id}>", True),
+            ("👥 **Admins**", f"{len(bot.admins)}", True),
+            ("🚀 **Total VPS**", f"{total_servers}", True),
+            ("👤 **Users**", f"{total_users}", True),
+            ("📊 **Server Limit**", f"{SERVER_LIMIT} per user", True)
+        ],
+        footer="Created with 💖"
+    )
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="help", description="❓ Show help message")
+async def help_command(interaction: discord.Interaction):
+    """Show help"""
+    embed = create_embed(
+        "✨ VPS Bot Help",
+        "Here are all available commands:",
+        color=EMBED_COLOR
+    )
+
+    commands_list = [
+        ("📜 `/list`", "List your instances"),
+        ("📜 `/list-all`", "[ADMIN] List all instances"),
+        ("🟢 `/start <id>`", "Start your instance"),
+        ("🛑 `/stop <id>`", "Stop your instance"),
+        ("🔄 `/restart <id>`", "Restart your instance"),
+        ("🔄 `/regen-ssh <id>`", "Regenerate SSH"),
+        ("🗑️ `/remove <id>`", "Delete an instance"),
+        ("📊 `/resources`", "Show system resources"),
+        ("🏓 `/ping`", "Check latency"),
+        ("⏱️ `/uptime`", "Bot uptime"),
+        ("ℹ️ `/about`", "About the bot"),
+        ("👑 `/admin`", "[ADMIN] Manage admins"),
+        ("👑 `/admins`", "List admins"),
+        ("❌ `/delete-container <id>`", "[ADMIN] Force delete container")
+    ]
+    
+    # Add deploy command for admins
+    if is_admin(interaction.user.id):
+        commands_list.insert(0, ("🚀 `/deploy @user <os>`", "[ADMIN] Deploy VPS"))
+    
+    for cmd, desc in commands_list:
+        embed.add_field(name=cmd, value=desc, inline=False)
+    
+    # Add OS information
+    os_info = "\n".join([f"{os_data['emoji']} **{os_id}** - {os_data['description']}" 
+                        for os_id, os_data in OS_OPTIONS.items()])
+    embed.add_field(name="🖥️ Available Operating Systems", value=os_info, inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+# ==================== EVENTS ====================
+
+@bot.event
+async def on_ready():
+    """Called when bot is ready"""
+    print(f"✅ {bot.bot_name} is online!")
+    print(f"📊 Bot ID: {bot.user.id}")
+    print(f"👑 Main Admin: {bot.main_admin_id}")
+    print(f"👥 Admins: {len(bot.admins)}")
+    print(f"📁 Database: {os.path.exists(database_file)}")
+    
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ Synced {len(synced)} commands")
+    except Exception as e:
+        print(f"❌ Error syncing commands: {e}")
+    
+    change_status.start()
+
+@tasks.loop(seconds=5)
+async def change_status():
+    """Change bot status periodically"""
+    try:
+        instance_count = len(open(database_file).readlines()) if os.path.exists(database_file) else 0
+        statuses = [
+            f"🌠 Managing {instance_count} Instances",
+            f"⚡ Powering {instance_count} Servers",
+            f"🔮 Watching {instance_count} VMs",
+            f"🚀 Hosting {instance_count} VPS",
+            f"💻 Serving {instance_count} Terminals",
+            f"🌐 Running {instance_count} Nodes"
+        ]
+        await bot.change_presence(activity=discord.Game(name=random.choice(statuses)))
+    except Exception as e:
+        print(f"💥 Failed to update status: {e}")
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Handle command errors"""
+    if isinstance(error, commands.CommandNotFound):
+        return
+    print(f"Error: {error}")
+
+# ==================== START BOT ====================
 if __name__ == "__main__":
     try:
-        os.makedirs("temp_dockerfiles", exist_ok=True)
-        os.makedirs("migrations", exist_ok=True)
-        
         bot.run(TOKEN)
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped by user")
+        bot.save_admins()
     except Exception as e:
-        logger.error(f"Bot crashed: {e}")
-        traceback.print_exc()
-# =========================================== BOT CODE ENDS HERE ===========================================
+        print(f"❌ Fatal error: {e}")
+        bot.save_admins()
